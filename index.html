@@ -88,15 +88,27 @@
 <!-- ============ ARENA ============ -->
 <section id="screen-arena" class="screen">
   <div class="container">
+    <!-- Brand art above the pre-start card. Filled by AssetManager in init()
+         (same slot mechanism as the home hero), so it falls back to emoji if the
+         file is missing and picks up real art with no code change. Shown/hidden
+         together with #arenaPreStart. -->
+    <div class="arena-art" id="arenaArtSlot"></div>
+
     <div id="arenaPreStart" class="card purple center">
       <h2>READY FOR MADNESS?</h2>
       <p class="mt8">Start a session to begin predicting meme coin moves.</p>
+      <!-- Filled from CONFIG.SESSION_SECONDS in init() so the stated length can
+           never drift from the clock that enforces it. -->
+      <p class="mt8 session-len-note" id="arenaSessionNote"></p>
       <button class="btn btn-yellow btn-block mt16" onclick="Game.startSession()">START SESSION</button>
     </div>
 
     <div id="arenaGame" style="display:none;">
       <div class="arena-top">
         <div class="round-tag" id="roundTag">ROUND 01</div>
+        <!-- The session clock: 10 minutes for the whole run, sitting above the
+             per-round countdown in #timerCircle. -->
+        <div class="session-clock" id="sessionClock" role="timer" aria-live="off" aria-label="Time left in this session">SESSION 10:00</div>
         <div class="arena-actions">
           <button class="btn" onclick="Game.restartSessionRequest()">RESTART</button>
           <button class="btn" onclick="Game.confirmEndSession()">END SESSION</button>
@@ -220,6 +232,15 @@
   <div class="container">
     <h2 class="section-title">MEME MADNESS COMPLETE!</h2>
     <div class="share-card" id="shareCardRoot"></div>
+
+    <!-- "How you'd have done in the real Cade Meme Madness" — the simulated
+         comparison against the real campaign's daily prize tiers, filled by
+         UI.renderCampaignSim(). Sits with the rest of the end-of-session summary,
+         directly under the share card and above the share/play-again actions.
+         Nothing in it is a real prize; the panel carries a SIMULATED badge and
+         the full disclaimer from rules.js. -->
+    <div id="campaignSimRoot"></div>
+
     <div class="hero-cta mt16">
       <button class="btn btn-yellow btn-block" onclick="Game.shareOnX()">SHARE ON X</button>
       <button class="btn btn-block" onclick="Game.copyResults()">COPY RESULTS</button>

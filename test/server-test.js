@@ -363,7 +363,7 @@ function api(method, route, body, deviceId) {
     });
 
     check("neither side re-declares a rules table of its own", () => {
-      const decl = /(?:const|let|var)\s+(OUTCOMES|COIN_POOL|AWARD_DEFS|SIM_PLAYERS_BASE)\s*=\s*[[{]/;
+      const decl = /(?:const|let|var)\s+(OUTCOMES|COIN_POOL|AWARD_DEFS|SIM_PLAYERS_BASE|PRIZE_TIERS|SIDE_QUESTS)\s*=\s*[[{]/;
       const offenders = [];
       if (decl.test(clientSrc)) offenders.push("app.js: " + clientSrc.match(decl)[1]);
       if (decl.test(serverSrc)) offenders.push("server/server.js: " + serverSrc.match(decl)[1]);
@@ -373,12 +373,16 @@ function api(method, route, body, deviceId) {
     });
 
     check("neither side hard-codes a payout number", () => {
-      const nums = /(?:PAYOUT_MULTIPLIER|DAILY_POINTS|DYNAMIC_COIN_CHANCE)\s*:\s*[\d.]/;
+      const nums = /(?:PAYOUT_MULTIPLIER|DAILY_POINTS|DYNAMIC_COIN_CHANCE|SESSION_SECONDS|VOTE_WINDOW_MS)\s*:\s*[\d.]/;
       const offenders = [];
       if (nums.test(clientSrc)) offenders.push("app.js");
       if (nums.test(serverSrc)) offenders.push("server/server.js");
       assert(offenders.length === 0, "payout constants re-declared in " + offenders.join(", "));
-      return "×" + Rules.CONFIG.PAYOUT_MULTIPLIER + ", " + Rules.CONFIG.DAILY_POINTS + "/day";
+      // The vote window lived as a literal hour in app.js and cli.js at once.
+      assert(!/60\s*\*\s*60\s*\*\s*1000/.test(clientSrc),
+        "app.js hard-codes the vote window instead of using CONFIG.VOTE_WINDOW_MS");
+      return "×" + Rules.CONFIG.PAYOUT_MULTIPLIER + ", " + Rules.CONFIG.DAILY_POINTS + "/day, " +
+        Rules.CONFIG.SESSION_SECONDS + "s sessions";
     });
 
     /* Static checks can only prove nobody re-copied the table. This one proves
@@ -431,6 +435,39 @@ function api(method, route, body, deviceId) {
 
     const hist = await api("GET", "/history", undefined, D);
     check("the forged session is not in the history", () => eq(hist.body.sessions.length, 0));
+  }
+
+  {
+    /* The session clock and the campaign comparison are front-end concerns — the
+       server has no duration logic and rolls no comparison. What it must not do is
+       drop them: it archives whatever session the client hands it, so a field it
+       does not know about has to survive the round-trip or the history it serves
+       back would be missing the panel and the deadline. */
+    const D = "dev_session_fields";
+    const Rules = require(path.join(__dirname, "..", "rules.js"));
+    await api("POST", "/daily-claim", {}, D);
+    const endsAt = 1786000000000 + Rules.CONFIG.SESSION_SECONDS * 1000;
+    await api("POST", "/session/start", {
+      session: { sessionId: "s_clock", startedAt: 1786000000000, endsAt, timeExpired: false,
+        startingBalance: 20000, rounds: [], wins: 0, losses: 0 }
+    }, D);
+    const campaign = Rules.simulateCampaignResult({ netResult: 4200, wins: 3, losses: 1, rounds: [] });
+    const ended = await api("POST", "/session/end", {
+      session: { sessionId: "s_clock", endsAt, timeExpired: true, netResult: 4200, campaign }
+    }, D);
+    const back = await api("GET", "/history", undefined, D);
+    check("the session clock and campaign comparison survive the server round-trip", () => {
+      eq(ended.status, 200, "session/end returned " + JSON.stringify(ended.body));
+      const s = back.body.sessions[0];
+      assert(s, "the session was not archived at all");
+      eq(s.endsAt, endsAt, "the server dropped the session deadline");
+      eq(s.timeExpired, true, "the server dropped the time-expired flag");
+      assert(s.campaign, "the server dropped the campaign comparison");
+      eq(s.campaign.rank, campaign.rank, "the archived rank changed in transit");
+      eq(s.campaign.disclaimer, Rules.CAMPAIGN_DISCLAIMER, "the archived disclaimer changed in transit");
+      return "rank #" + s.campaign.rank + " and a " +
+        Rules.CONFIG.SESSION_SECONDS / 60 + "-minute deadline both preserved";
+    });
   }
 
   console.log("\n" + "=".repeat(60));

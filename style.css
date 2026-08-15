@@ -79,6 +79,17 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .art-slot img{width:100%;height:100%;object-fit:contain;}
 .art-slot.hero-art-slot{font-size:5rem;width:auto;height:auto;}
 .art-slot.hero-art-slot img{width:100%;max-width:340px;height:auto;object-fit:contain;}
+/* Arena pre-start art. The aspect-ratio is what guarantees a box to paint into:
+   hero-artwork.svg carries a viewBox, and an <img> sized `height:auto` from a
+   viewBox alone can resolve to zero height — which renders as blank space
+   rather than a broken-image icon, so it looks like a missing file. */
+.arena-art{display:flex;align-items:center;justify-content:center;font-size:5rem;margin:0 0 16px;}
+.arena-art .art-slot{width:100%;height:auto;}
+.arena-art .art-slot img{
+  width:100%;max-width:420px;height:auto;aspect-ratio:3 / 2;object-fit:contain;
+  border:var(--border) solid var(--black);border-radius:var(--radius);
+  box-shadow:6px 6px 0 var(--black);background:var(--purple);
+}
 .art-slot.coin-art-slot{font-size:2rem;width:100%;height:100%;}
 .art-slot.award-art-slot{font-size:3.5rem;width:100%;height:100%;}
 .art-slot.avatar-art-slot{font-size:1rem;width:100%;height:100%;}
@@ -147,8 +158,24 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .boost-card.done{opacity:.6;}
 
 /* ---------- ARENA ---------- */
-.arena-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;}
+.arena-top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;}
 .round-tag{font-weight:900;color:var(--purple);letter-spacing:1px;}
+/* The session clock — the 10-minute cap on the whole run, distinct from the
+   per-round .timer-circle. Tabular figures so the seconds ticking down don't
+   shift the label's width once a second. */
+.session-clock{
+  font-weight:900;font-size:.8rem;letter-spacing:1px;
+  background:var(--black);color:var(--cream);
+  padding:6px 10px;border-radius:10px;
+  font-variant-numeric:tabular-nums;
+}
+.session-clock.urgent{background:var(--red-a11y);color:#fff;}
+/* The session-length line on the READY FOR MADNESS? card. Sits on the purple
+   card, so it needs the light-on-dark treatment .muted doesn't give. */
+.session-len-note{
+  font-weight:900;font-size:.72rem;letter-spacing:1px;
+  color:var(--yellow);
+}
 .timer-wrap{text-align:center;margin:18px 0;}
 .timer-circle{
   width:120px;height:120px;border-radius:50%;border:6px solid var(--black);
@@ -360,6 +387,38 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .share-grid .box .v{font-weight:900;font-size:1.2rem;color:var(--yellow);}
 .award-chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}
 .award-chip{background:var(--yellow);color:var(--black);border-radius:999px;padding:4px 10px;font-weight:900;font-size:.75rem;}
+
+/* ---------- SIMULATED REAL-CAMPAIGN COMPARISON ----------
+   The "if this were the real campaign" panel on the session summary. Styled as
+   a plain cream card rather than another purple hero card, deliberately: it sits
+   directly under the purple share card and must read as commentary on the run,
+   not as a second trophy. The disclaimer is part of the component, not an
+   afterthought bolted below it. */
+.campaign-sim{margin-top:16px;}
+.campaign-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.campaign-head h3{margin:0;font-size:1rem;letter-spacing:1px;}
+.campaign-rank{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0;}
+.campaign-rank .box{
+  background:var(--cream);border:3px solid var(--black);border-radius:12px;
+  padding:10px;text-align:center;
+}
+.campaign-rank .box .v{font-weight:900;font-size:1.5rem;line-height:1.1;}
+.campaign-rank .box.paid{background:var(--yellow);}
+.campaign-rank .box .muted{font-size:.62rem;font-weight:900;letter-spacing:.5px;}
+.campaign-headline{font-weight:900;line-height:1.4;}
+.campaign-quests{margin-top:14px;border-top:3px dashed var(--black);padding-top:12px;}
+.campaign-quests-title{font-weight:900;font-size:.68rem;letter-spacing:1px;opacity:.7;margin-bottom:8px;}
+.campaign-quest{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px;}
+.campaign-quest-icon{font-size:1.5rem;line-height:1;}
+.campaign-quest-text{font-weight:700;line-height:1.35;}
+.campaign-quest-text .block{display:block;font-weight:400;margin-top:2px;}
+/* Not decoration: this is the sentence that keeps a dollar figure from reading
+   as a promise, so it gets real contrast rather than fine print. */
+.campaign-disclaimer{
+  margin-top:14px;font-size:.72rem;line-height:1.45;
+  background:var(--black);color:var(--cream);
+  border-radius:10px;padding:10px 12px;
+}
 
 .bottom-nav{position:sticky;bottom:0;background:var(--black);display:flex;justify-content:space-around;padding:8px 0;border-top:var(--border) solid var(--black);z-index:50;}
 .bottom-nav button{background:none;border:none;color:#bbb;font-weight:900;font-size:.7rem;display:flex;flex-direction:column;align-items:center;gap:2px;min-height:44px;min-width:44px;padding:4px 6px;justify-content:center;}

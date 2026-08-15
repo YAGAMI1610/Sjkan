@@ -76,7 +76,7 @@ const unhandled = [];
 
 /* An unhandled rejection is the quietest failure this app can have: an async
    handler throws, nothing catches it, the user gets no feedback and the console
-   message is easy to miss. Collect them for §16 rather than letting the process
+   message is easy to miss. Collect them for §20 rather than letting the process
    print a warning and carry on. */
 process.on("unhandledRejection", r => unhandled.push(String(r && r.message || r)));
 
@@ -135,7 +135,7 @@ const BRIDGE = `
 window.__app = {
   get STATE(){ return STATE; },
   CONFIG, Game, Round, UI, Nav, Api, AudioHooks, MarketEngine, MemeImage,
-  AssetManager, Ceremony, Records, Awards, ShareCard, Confetti, COIN_POOL,
+  AssetManager, Ceremony, Records, Awards, ShareCard, Confetti, COIN_POOL, SessionClock,
   COIN_PREFIXES, COIN_SUFFIXES, OUTCOMES, AWARD_DEFS, saveState, loadState,
   Leaderboard, awardsOf, trimRoundForStorage, HISTORY_LIMIT, CadeRules
 };`;
@@ -364,12 +364,23 @@ async function playRound(dir, stake) {
     eq($("#revRisk").textContent, "1,000");
     assert(/UP/.test($("#revPrediction").textContent), "prediction not shown");
   });
+  /* Captured before the lock, because locking is now the moment the stake leaves
+     the balance. Group 7's net-movement assertion measures from here. */
+  const balanceBeforeLock = app.STATE.balance;
   app.Game.lockInPrediction();
   await tick(5);
   check("lock-in freezes the controls and shows the banner", () => {
     assert($("#lockedBanner").style.display !== "none", "locked banner hidden");
     eq($("#upBtn").disabled, true, "UP button still live after lock-in");
     eq(app.Round.locked, true);
+  });
+  check("the stake leaves the balance at lock-in, not 25s later at resolve", () => {
+    // The countdown keeps running after the lock. The stake is committed for the
+    // whole of it, so it cannot still be sitting in the spendable balance.
+    eq(app.STATE.balance, balanceBeforeLock - 1000, "balance after lock");
+    eq(app.Round.escrow, 1000, "Round.escrow");
+    eq(app.STATE.pendingStake, 1000, "STATE.pendingStake (persisted for reloads)");
+    return balanceBeforeLock.toLocaleString() + " → " + app.STATE.balance.toLocaleString();
   });
 
   group("6. Outcome resolution — direction can never contradict the %");
@@ -400,7 +411,10 @@ async function playRound(dir, stake) {
 
   group("7. Balance math (§11/§12 — a win pays risk × 1.8)");
   {
-    const before = app.STATE.balance;
+    // Measured from before the lock: the stake was debited there, the escrow is
+    // returned at resolve, and the round's payout is the *net* delta. So the
+    // per-round movement is unchanged by escrowing — that is the invariant here.
+    const before = balanceBeforeLock;
     window.clearInterval(app.Round.timerId);
     app.Round.resolve();
     await tick(30);
@@ -409,6 +423,10 @@ async function playRound(dir, stake) {
     check("balance moved by exactly the round's payout", () => {
       assert(Number.isFinite(app.STATE.balance), "balance is not finite: " + app.STATE.balance);
       eq(app.STATE.balance, before + r.payout, "balance " + before + " + payout " + r.payout);
+    });
+    check("resolve returns the escrow — nothing is left committed", () => {
+      eq(app.Round.escrow, 0, "Round.escrow after resolve");
+      eq(app.STATE.pendingStake, 0, "STATE.pendingStake after resolve");
     });
     check("payout honours the WIN/LOSS contract", () => {
       if (r.result === "WIN") eq(r.payout, Math.round(r.riskAmount * 1.8), "WIN payout");
@@ -887,7 +905,468 @@ async function playRound(dir, stake) {
     assert(audioOk, "AudioHooks was not defined when storage throws");
   });
 
-  group("16. Nothing accumulated errors during the whole run");
+  group("16. Stake escrow — a committed stake is held for the life of the round");
+
+  check("ending a session mid-round returns the stake, and archives it", () => {
+    /* Ending a session while a round is locked used to be harmless because the
+       balance was only touched at resolve. Now the stake is already out, so
+       endSession() has to settle it *before* snapshotting endingBalance —
+       otherwise the archived session carries a phantom loss and netResult is
+       short by the stake forever. */
+    const startBal = app.STATE.balance;
+    app.Game.startSession();
+    const sessionStart = app.STATE.balance;
+    app.Game.selectPrediction("UP");
+    app.Game.selectRisk(1500);
+    app.Game.reviewPrediction();
+    app.Game.lockInPrediction();
+    eq(app.STATE.balance, sessionStart - 1500, "stake was not debited at lock");
+
+    app.Game.endSession();
+    eq(app.STATE.balance, sessionStart, "ending mid-round did not return the stake");
+    eq(app.STATE.pendingStake, 0, "pendingStake outlived the session");
+    const archived = app.STATE.history[0];
+    eq(archived.endingBalance, sessionStart, "archived endingBalance is off by the stake");
+    eq(archived.netResult, sessionStart - archived.startingBalance, "archived netResult is wrong");
+
+    // The abandoned round's timer still fires later. settleEscrow() is idempotent,
+    // so that must not hand the stake back a second time.
+    window.clearInterval(app.Round.timerId);
+    app.Round.resolve();
+    eq(app.STATE.balance, sessionStart, "the stake was refunded twice");
+    return startBal.toLocaleString() + " → " + app.STATE.balance.toLocaleString() + " (unchanged)";
+  });
+
+  check("a stake orphaned by a reload is returned on the next load", () => {
+    /* Round lives in memory and no round is ever resumed, so a reload between the
+       lock and the resolve leaves a debited balance and no round to pay it back.
+       loadState() has to notice and refund, or the points are simply gone. */
+    const KEY = "cade_meme_madness_v1";
+    const original = window.localStorage.getItem(KEY);
+    try {
+      window.localStorage.setItem(KEY, JSON.stringify({
+        userId: "user_orphan", balance: 5000, pendingStake: 2000, history: [], session: null
+      }));
+      const reloaded = app.loadState();
+      eq(reloaded.balance, 7000, "orphaned stake was not returned");
+      eq(reloaded.pendingStake, 0, "pendingStake survived the refund");
+      const persisted = JSON.parse(window.localStorage.getItem(KEY));
+      eq(persisted.balance, 7000, "the refund was not persisted");
+      eq(persisted.pendingStake, 0, "the persisted pendingStake was not cleared");
+      return "5,000 + 2,000 orphaned → 7,000";
+    } finally {
+      if (original === null) window.localStorage.removeItem(KEY);
+      else window.localStorage.setItem(KEY, original);
+    }
+  });
+
+  check("a garbage pendingStake cannot mint points", () => {
+    const KEY = "cade_meme_madness_v1";
+    const original = window.localStorage.getItem(KEY);
+    try {
+      for (const junk of [-500, "banana", null, undefined, NaN, Infinity]) {
+        window.localStorage.setItem(KEY, JSON.stringify({
+          userId: "u", balance: 1000, pendingStake: junk, history: [], session: null
+        }));
+        const s = app.loadState();
+        assert(Number.isFinite(s.balance), "balance became " + s.balance + " for pendingStake " + junk);
+        eq(s.balance, 1000, "pendingStake " + JSON.stringify(junk) + " changed the balance");
+      }
+      return "6 malformed values ignored";
+    } finally {
+      if (original === null) window.localStorage.removeItem(KEY);
+      else window.localStorage.setItem(KEY, original);
+    }
+  });
+
+  group("17. Arena pre-start art");
+
+  check("the arena art slot exists and is filled from the hero asset", () => {
+    const slot = doc.getElementById("arenaArtSlot");
+    assert(slot, "#arenaArtSlot is missing from index.html");
+    const inner = slot.querySelector(".art-slot");
+    assert(inner, "#arenaArtSlot was never filled by AssetManager (init() did not wire it)");
+    // jsdom loads no images, so the fallback is what renders here — the point is
+    // that the slot has content rather than being an empty box.
+    assert(slot.textContent.trim().length > 0 || slot.querySelector("img"),
+      "the arena art slot renders nothing at all — this is the empty space that was reported");
+    return "filled with " + (slot.querySelector("img") ? "the real asset" : "the emoji fallback");
+  });
+
+  check("the arena art sits above the READY FOR MADNESS? card", () => {
+    const slot = doc.getElementById("arenaArtSlot");
+    const card = doc.getElementById("arenaPreStart");
+    assert(slot && card, "one of the two elements is missing");
+    eq(slot.parentElement, card.parentElement, "the art is not a sibling of the pre-start card");
+    assert(slot.compareDocumentPosition(card) & 4 /* DOCUMENT_POSITION_FOLLOWING */,
+      "the art renders after the card, not above it");
+  });
+
+  check("the art is hidden while a session is live and returns after it", () => {
+    const slot = doc.getElementById("arenaArtSlot");
+    app.Game.startSession();
+    eq(slot.style.display, "none", "the art stayed on screen during play");
+    app.Game.endSession();
+    app.Game.playAgain();
+    assert(slot.style.display !== "none", "the art did not come back on PLAY AGAIN");
+  });
+
+  check("the CSS gives the arena art a box to paint into", () => {
+    // An <img> sized from a viewBox alone can resolve to zero height, which looks
+    // exactly like a missing image: blank space, no broken-image icon.
+    const css = fs.readFileSync(path.join(ROOT, "style.css"), "utf8");
+    const block = css.slice(css.indexOf(".arena-art .art-slot img{"));
+    assert(block, ".arena-art .art-slot img rule is missing");
+    assert(/aspect-ratio\s*:/.test(block.slice(0, 300)), "no aspect-ratio on the arena art image");
+    const svg = fs.readFileSync(path.join(ROOT, "assets", "hero-artwork.svg"), "utf8");
+    assert(/<svg[^>]*\bwidth="/.test(svg) && /<svg[^>]*\bheight="/.test(svg),
+      "hero-artwork.svg has no intrinsic width/height");
+  });
+
+  group("18. Session clock — a run is capped at ten minutes");
+
+  check("the arena shows the clock and says how long a run is", () => {
+    const clock = doc.getElementById("sessionClock");
+    assert(clock, "#sessionClock is missing from index.html");
+    const note = doc.getElementById("arenaSessionNote");
+    assert(note, "#arenaSessionNote is missing from index.html");
+    // The note is built from CONFIG rather than typed, so it cannot claim ten
+    // minutes after someone retunes SESSION_SECONDS.
+    const mins = app.CONFIG.SESSION_SECONDS / 60;
+    assert(note.textContent.indexOf(mins + "-MINUTE") !== -1,
+      "the arena note does not state the session length: " + JSON.stringify(note.textContent));
+    assert(note.textContent.indexOf(app.CONFIG.ROUND_SECONDS + "s") !== -1,
+      "the arena note does not state the per-round window");
+    return mins + "-minute session, " + app.CONFIG.ROUND_SECONDS + "s rounds";
+  });
+
+  check("starting a session sets an absolute deadline and shows it counting", () => {
+    app.Game.startSession();
+    const s = app.STATE.session;
+    assert(s.endsAt, "the session carries no endsAt deadline");
+    const span = s.endsAt - s.startedAt;
+    // A deadline rather than a counted-down number: a backgrounded tab whose
+    // interval is throttled still returns to the right remaining time.
+    assert(Math.abs(span - app.CONFIG.SESSION_SECONDS * 1000) < 2000,
+      "the deadline is " + Math.round(span / 1000) + "s out, expected " + app.CONFIG.SESSION_SECONDS);
+    eq(s.timeExpired, false, "a fresh session is already flagged as expired");
+    eq(doc.getElementById("sessionClock").textContent,
+      "SESSION " + app.SessionClock.format(app.CONFIG.SESSION_SECONDS * 1000),
+      "the clock chip does not show the full session length");
+    return "deadline " + app.SessionClock.format(app.SessionClock.remainingMs()) + " out";
+  });
+
+  check("the last round shortens to whatever the session has left", () => {
+    const s = app.STATE.session;
+    const full = s.endsAt;
+    try {
+      eq(app.SessionClock.roundSeconds(), app.CONFIG.ROUND_SECONDS, "a fresh session shortened a round");
+      // 8s left is less than a 25s round, so the round has to end at the buzzer
+      // or "ten minutes" is a lie by up to seventeen seconds.
+      s.endsAt = Date.now() + 8000;
+      eq(app.SessionClock.roundSeconds(), 8, "the final round was not clipped to the session remainder");
+      assert(app.SessionClock.roundFits(), "8s should still be worth a round");
+      s.endsAt = Date.now() + 2000;
+      assert(!app.SessionClock.roundFits(),
+        "2s left still counts as room for a round (below SESSION_MIN_ROUND_SECONDS)");
+      assert(app.SessionClock.roundSeconds() >= 1, "roundSeconds() went to zero");
+      return "25s → 8s → no round";
+    } finally {
+      s.endsAt = full;
+    }
+  });
+
+  check("Round.advance() ends the session once the clock is up", () => {
+    const s = app.STATE.session;
+    const historyBefore = app.STATE.history.length;
+    s.endsAt = Date.now() - 1;
+    assert(app.SessionClock.expired(), "expired() did not notice the passed deadline");
+    app.Round.advance();
+    eq(app.STATE.session, null, "the session survived its own deadline");
+    eq(app.STATE.history.length, historyBefore + 1, "the expired run was not archived");
+    return "archived at the buzzer";
+  });
+
+  check("a locked round at the buzzer is still resolved, not cancelled", () => {
+    /* The stake is out and the outcome was rolled before the clock ran out, so
+       cancelling the round would take a paid-for prediction off the player. It
+       resolves, its result card is the last thing shown, and the card's button
+       goes to the summary rather than dealing another coin. */
+    app.Game.startSession();
+    const s = app.STATE.session;
+    const roundsBefore = s.rounds.length;
+    app.Game.selectPrediction("UP");
+    app.Game.selectRisk(1000);
+    app.Game.reviewPrediction();
+    app.Game.lockInPrediction();
+    s.endsAt = Date.now() - 1;
+    app.SessionClock.timeUp();
+    eq(s.timeExpired, true, "the session was not flagged as time-expired");
+    eq(s.rounds.length, roundsBefore + 1, "the locked round was thrown away at the buzzer");
+    eq(app.STATE.pendingStake, 0, "the stake was left in escrow");
+    const card = doc.getElementById("resultRoot").textContent;
+    assert(card.indexOf("SEE FINAL RESULT") !== -1,
+      "the last result card still offers another round: " + card.slice(0, 160));
+    // ...and that button is the only way on, so it must archive rather than deal.
+    app.Round.advance();
+    eq(app.STATE.session, null, "the run did not end after time expired");
+    eq(app.STATE.history[0].timeExpired, true, "the archived run is not flagged as time-expired");
+    return "round " + app.STATE.history[0].rounds.length + " honoured, then archived";
+  });
+
+  check("a run left open by a closed tab is archived on the next load", () => {
+    const KEY = "cade_meme_madness_v1";
+    const original = window.localStorage.getItem(KEY);
+    const liveHistory = app.STATE.history.length;
+    const stale = {
+      sessionId: "sess_stale", userId: "user_stale",
+      startedAt: Date.now() - 900000, endsAt: Date.now() - 300000, timeExpired: false,
+      startingBalance: 9000, rounds: [{ result: "WIN", payout: 1800, riskAmount: 1000 }],
+      wins: 1, losses: 0, totalRisked: 1000, totalProfit: 1800, totalLoss: 0,
+      largestRisk: 1000, largestPayout: 1800, currentStreak: 1, longestWinStreak: 1,
+      awards: [], coinsEncountered: []
+    };
+    try {
+      /* loadState() has to *keep* an expired session: it runs at module scope,
+         before Game and SessionClock exist, so closing the run is init()'s job and
+         a load that quietly dropped it would lose the rounds outright. */
+      window.localStorage.setItem(KEY, JSON.stringify({
+        userId: "user_stale", balance: 10800, pendingStake: 0, history: [], session: stale
+      }));
+      const reloaded = app.loadState();
+      assert(reloaded.session, "loadState() dropped a session whose deadline had passed");
+      eq(reloaded.session.sessionId, "sess_stale");
+
+      // STATE is a module-scope `let` the harness can only read, so stand the
+      // stale run up on the live state the way a real reload would.
+      app.STATE.session = reloaded.session;
+      const closed = app.Game.closeExpiredSession();
+      assert(closed, "closeExpiredSession() did not close a run whose deadline had passed");
+      eq(app.STATE.session, null, "the stale session is still live");
+      eq(app.STATE.history.length, liveHistory + 1, "the stale run was dropped instead of archived");
+      const archived = app.STATE.history[0];
+      eq(archived.sessionId, "sess_stale", "some other session was archived");
+      eq(archived.timeExpired, true, "the archived stale run is not flagged");
+      assert(archived.campaign, "the archived stale run got no campaign comparison");
+      eq(app.STATE.session, null);
+      return "1 round preserved, run moved to History with no ceremony";
+    } finally {
+      if (original === null) window.localStorage.removeItem(KEY);
+      else window.localStorage.setItem(KEY, original);
+    }
+  });
+
+  check("the voting window comes from CONFIG, not a hard-coded hour", () => {
+    const src = fs.readFileSync(path.join(ROOT, "app.js"), "utf8");
+    assert(/CONFIG\.VOTE_WINDOW_MS/.test(src), "app.js no longer reads CONFIG.VOTE_WINDOW_MS");
+    assert(!/60\s*\*\s*60\s*\*\s*1000/.test(src), "app.js hard-codes an hour-long vote window again");
+    eq(app.CONFIG.VOTE_WINDOW_MS, app.CONFIG.SESSION_SECONDS * 1000,
+      "the vote window and the session length have drifted apart");
+    return app.CONFIG.VOTE_WINDOW_MS / 60000 + " minutes";
+  });
+
+  group("19. Campaign comparison — simulated, and labelled as such");
+
+  const Rules = app.CadeRules;
+
+  check("every prize tier boundary maps to the published table", () => {
+    const expected = [
+      [1, 2000], [2, 1200], [3, 800], [4, 600], [5, 500],
+      [6, 300], [10, 300], [11, 120], [20, 120],
+      [21, 50], [40, 50], [41, 20], [100, 20]
+    ];
+    for (const [rank, usd] of expected) {
+      const tier = Rules.prizeForRank(rank);
+      assert(tier, "rank " + rank + " pays nothing but should pay $" + usd);
+      eq(tier.usd, usd, "rank " + rank);
+    }
+    eq(Rules.prizeForRank(101), null, "rank 101 was paid — the table stops at 100");
+    eq(Rules.prizeForRank(0), null, "rank 0 was paid");
+    eq(Rules.prizeForRank(-3), null, "a negative rank was paid");
+    return expected.length + " boundaries + 3 non-paying ranks";
+  });
+
+  check("rank is one plus the rivals strictly ahead, ties to the player", () => {
+    // A fixed field keeps this about the ranking rule rather than the RNG.
+    const rivals = [];
+    for (let i = 0; i < 149; i++) rivals.push({ net: i * 100, predictions: 4, bestPayout: 900 });
+    const at = net => Rules.simulateCampaignResult(
+      { netResult: net, wins: 1, losses: 1, rounds: [] }, { rivals, fieldSize: 150 });
+
+    eq(at(1000000).rank, 1, "a runaway score did not rank first");
+    eq(at(-1).rank, 150, "the worst score did not rank last");
+    // 14,800 is rival index 148's exact score: matching it must not rank behind it.
+    eq(at(14800).rank, 1, "a tie with the top rival cost the player the rank");
+    eq(at(14700).rank, 2, "second place is off by one");
+    const mid = at(9900); // 49 rivals (10,000 … 14,800) score above 9,900
+    eq(mid.rank, 50, "mid-field rank is wrong");
+    eq(mid.prizeUsd, 20, "rank 50 should sit in the 41st–100th tier");
+    eq(mid.fieldSize, 150, "fieldSize was not reported");
+    eq(mid.paidRanks, 100, "paidRanks should be the paying cut, not the field");
+    return "150-entrant field, ranks 1/2/50/150 all correct";
+  });
+
+  check("both headline wordings are reachable", () => {
+    const rivals = [];
+    for (let i = 0; i < 149; i++) rivals.push({ net: i * 100, predictions: 4, bestPayout: 900 });
+    const win = Rules.campaignResultLines(Rules.simulateCampaignResult(
+      { netResult: 1000000, wins: 5, losses: 0, rounds: [] }, { rivals, fieldSize: 150 }));
+    assert(/ranked around number 1 and won \$2,000!/.test(win.headline), "top-rank wording: " + win.headline);
+
+    const miss = Rules.campaignResultLines(Rules.simulateCampaignResult(
+      { netResult: -999999, wins: 0, losses: 5, rounds: [] }, { rivals, fieldSize: 150 }));
+    assert(/wouldn't have placed in the top 100\.$/.test(miss.headline),
+      "no-prize wording should name the paying cut, not the field: " + miss.headline);
+    return "$2,000 headline + top-100 miss";
+  });
+
+  check("a field that pays 100 has to be bigger than 100, or nobody ever misses", () => {
+    /* The bug this pins: with a 100-entrant field and a table paying to 100th,
+       last place still wins $20 and the "wouldn't have placed" branch above is
+       dead code. The simulated field is the day's entrants; the top 100 is the
+       cut taken from it. */
+    assert(Rules.CAMPAIGN_ENTRANTS > Rules.PRIZE_FIELD_SIZE,
+      "CAMPAIGN_ENTRANTS (" + Rules.CAMPAIGN_ENTRANTS + ") must exceed PRIZE_FIELD_SIZE (" +
+      Rules.PRIZE_FIELD_SIZE + ") or every entrant places");
+    const worst = Rules.simulateCampaignResult({ netResult: -500000, wins: 0, losses: 9, rounds: [] });
+    eq(worst.placed, false, "a catastrophic run still placed against a live field");
+    eq(worst.prizeUsd, 0, "a non-placing run was given a prize");
+    return Rules.CAMPAIGN_ENTRANTS + " entrants, top " + Rules.PRIZE_FIELD_SIZE + " paid";
+  });
+
+  check("the simulated field is scored by the real scoreRound()", () => {
+    // Not a hand-tuned range: if PAYOUT_MULTIPLIER or RISK_TIERS move, the field
+    // moves with them, so the comparison can't quietly become unwinnable.
+    const field = Rules.simulateRivalScores(200);
+    eq(field.length, 200);
+    for (const r of field) {
+      assert(Number.isFinite(r.net), "a rival scored " + r.net);
+      assert(r.predictions >= 3, "a rival played " + r.predictions + " rounds");
+      assert(r.bestPayout >= 0, "a rival had a negative best payout");
+    }
+    const nets = field.map(r => r.net);
+    assert(Math.min(...nets) < 0 && Math.max(...nets) > 0,
+      "the simulated field has no losers or no winners — that is not a plausible day");
+    return "200 rivals, net " + Math.min(...nets).toLocaleString() + " … " + Math.max(...nets).toLocaleString();
+  });
+
+  check("side quests trigger on their own thresholds only", () => {
+    const rivals = [{ net: 0, predictions: 4, bestPayout: 100 }];
+    const q = (wins, losses, rounds) => Rules.simulateCampaignResult(
+      { netResult: 0, wins, losses, rounds }, { rivals, fieldSize: 2 }).quests.map(x => x.id);
+
+    const G = Rules.SIDE_QUESTS.GRINDER_QUEST.minPredictions;
+    eq(q(G - 1, 0, []).length, 0, (G - 1) + " predictions should not reach The Grinder");
+    assert(q(G, 0, []).indexOf("GRINDER_QUEST") !== -1, G + " predictions should reach The Grinder");
+    // Predictions, not rounds: a round the clock ran out on was never a call.
+    assert(q(G - 1, 1, []).indexOf("GRINDER_QUEST") !== -1, "wins + losses should both count");
+
+    const S = Rules.SIDE_QUESTS.SMASHER_QUEST.minPayout;
+    const hit = p => [{ result: "WIN", payout: p, riskAmount: Math.round(p / 1.8) }];
+    eq(q(1, 0, hit(S - 1)).length, 0, "a payout below the floor reached The Smasher");
+    assert(q(1, 0, hit(S)).indexOf("SMASHER_QUEST") !== -1, "a payout at the floor missed The Smasher");
+    const both = Rules.simulateCampaignResult(
+      { netResult: 0, wins: G, losses: 0, rounds: hit(S * 2) }, { rivals, fieldSize: 2 });
+    eq(both.quests.length, 2, "both quests should be able to fire at once");
+    return "grinder ≥" + G + " calls, smasher ≥" + S.toLocaleString() + " payout";
+  });
+
+  check("a losing session is never credited with a best winning round", () => {
+    const b = Rules.bestWinningRound({ rounds: [
+      { result: "LOSS", payout: -5000, riskAmount: 5000 },
+      { result: "SKIPPED", payout: 0, riskAmount: 0 }
+    ] });
+    eq(b.bestPayout, 0, "a loss was read as a best payout");
+    eq(b.bestMultiple, 0);
+    const trimmed = Rules.bestWinningRound({ rounds: [], largestPayout: 9000 });
+    eq(trimmed.bestPayout, 9000, "a trimmed session lost its largestPayout fallback");
+    assert(trimmed.bestMultiple > 0, "the fallback reported no multiple");
+    return "losses ignored, trimmed sessions fall back to largestPayout";
+  });
+
+  check("the quest detail formats big numbers", () => {
+    const r = Rules.simulateCampaignResult({
+      netResult: 0, wins: 1, losses: 0,
+      rounds: [{ result: "WIN", payout: 18000, riskAmount: 10000 }]
+    }, { rivals: [{ net: 0, predictions: 1, bestPayout: 0 }], fieldSize: 2 });
+    const smasher = r.quests.find(q => q.id === "SMASHER_QUEST");
+    assert(smasher, "a ×1.8 win on 10,000 did not reach The Smasher");
+    eq(smasher.detail, "1.8x on one call (+18,000)", "quest detail");
+  });
+
+  check("the summary screen renders the comparison panel", () => {
+    app.Game.startSession();
+    for (let i = 0; i < 2; i++) {
+      app.Game.selectPrediction("UP");
+      app.Game.selectRisk(1000);
+      app.Game.reviewPrediction();
+      app.Game.lockInPrediction();
+      window.clearInterval(app.Round.timerId);
+      app.Round.resolve();
+    }
+    app.Game.endSession();
+    const s = app.STATE.history[0];
+    assert(s.campaign, "endSession() did not archive a campaign comparison");
+    app.UI.renderSummary(s);
+    const root = doc.getElementById("campaignSimRoot");
+    assert(root, "#campaignSimRoot is missing from index.html");
+    const txt = root.textContent;
+    assert(root.querySelector(".campaign-sim"), "the panel did not render");
+    assert(/#\d+/.test(txt), "no rank shown: " + txt.slice(0, 120));
+    assert(txt.indexOf("If you performed like this in the real CADE Meme Madness") !== -1,
+      "the headline sentence is missing");
+    return "rank #" + s.campaign.rank + " of " + s.campaign.fieldSize;
+  });
+
+  check("no dollar figure appears without the disclaimer beside it", () => {
+    /* The whole panel hangs on this. A prize number on a results screen reads as
+       a promise unless it is fenced, so the badge and the full disclaimer are
+       treated as part of the number, not decoration. */
+    const root = doc.getElementById("campaignSimRoot");
+    const txt = root.textContent;
+    assert(/\$\d/.test(txt) || /NO PRIZE/.test(txt), "the panel shows neither a prize nor NO PRIZE");
+    const badge = root.querySelector(".sim-badge");
+    assert(badge && /SIMULATED/.test(badge.textContent), "the SIMULATED badge is missing");
+    const disc = root.querySelector(".campaign-disclaimer");
+    assert(disc, ".campaign-disclaimer is missing from the panel");
+    for (const phrase of ["Simulated comparison", "not affiliated", "not a real", "guaranteed"]) {
+      assert(disc.textContent.indexOf(phrase) !== -1,
+        "the disclaimer no longer says " + JSON.stringify(phrase));
+    }
+    eq(disc.textContent.trim(), Rules.CAMPAIGN_DISCLAIMER,
+      "the panel paraphrases the disclaimer instead of printing it");
+    return disc.textContent.length + " chars, verbatim from rules.js";
+  });
+
+  check("re-opening a run from history shows the same rank, not a fresh roll", () => {
+    const s = app.STATE.history[0];
+    const first = JSON.stringify(s.campaign);
+    app.UI.renderSummary(s);
+    app.UI.renderSummary(s);
+    eq(JSON.stringify(s.campaign), first, "the comparison was re-rolled on re-view");
+    // A session archived before the panel existed gets one rolled once, then kept.
+    delete s.campaign;
+    app.UI.renderSummary(s);
+    assert(s.campaign, "a legacy session got no comparison at all");
+    const backfilled = JSON.stringify(s.campaign);
+    app.UI.renderSummary(s);
+    eq(JSON.stringify(s.campaign), backfilled, "the backfilled comparison was re-rolled");
+    const persisted = JSON.parse(window.localStorage.getItem("cade_meme_madness_v1"));
+    assert(persisted.history[0].campaign, "the backfilled comparison was not persisted");
+    return "stable across 4 renders";
+  });
+
+  check("the CSS covers every class the panel emits", () => {
+    const css = fs.readFileSync(path.join(ROOT, "style.css"), "utf8");
+    const classes = ["campaign-sim", "campaign-head", "sim-badge", "campaign-rank",
+      "campaign-headline", "campaign-quests", "campaign-quest", "campaign-disclaimer",
+      "session-clock", "session-len-note"];
+    const missing = classes.filter(c => css.indexOf("." + c) === -1);
+    assert(missing.length === 0, "unstyled: " + missing.join(", "));
+    return classes.length + " classes styled";
+  });
+
+  group("20. Nothing accumulated errors during the whole run");
   check("no jsdomError at any point", () => {
     assert(pageErrors.length === 0, pageErrors.slice(0, 3).join("\n      "));
   });

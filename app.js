@@ -187,6 +187,12 @@ function defaultState(){
     boosts: { profile:false, share:false, submit:false, vote:false },
     session: null, // current active session
     history: [],
+    // Points committed to a locked round that has not resolved yet. The stake
+    // leaves `balance` the moment a prediction is locked, so it lives here until
+    // the round settles. Persisted, because a reload mid-round would otherwise
+    // leave the balance debited with no round left to pay it back — see the
+    // orphan refund in loadState().
+    pendingStake: 0,
     records: {
       highestBalance: 0, biggestPayout: 0, bestWinRate: 0,
       // `null` (not -Infinity) is the "no session recorded yet" sentinel:
@@ -209,6 +215,17 @@ function loadState(){
     const raw = localStorage.getItem(STORAGE_KEY);
     if(raw){
       const merged = Object.assign(defaultState(), JSON.parse(raw));
+      /* A stake is debited when a round locks and returned when it resolves. A
+         reload in between kills the round — Round lives in memory and no round is
+         ever resumed — so any pendingStake found at boot belongs to a round that
+         can never pay it back. Return it. Without this the player is simply short
+         the stake, with nothing on screen to explain where it went. */
+      const orphaned = Math.max(0, Math.floor(Number(merged.pendingStake) || 0));
+      if(orphaned > 0){
+        merged.balance += orphaned;
+        merged.pendingStake = 0;
+        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(merged)); }catch(e){}
+      }
       // Persist the userId the first time an older save is upgraded, so it stays
       // stable across reloads instead of being regenerated from defaultState().
       if(!JSON.parse(raw).userId){
@@ -380,6 +397,9 @@ const Game = {
       sessionId: uid("sess"),
       userId: STATE.userId,
       startedAt: Date.now(),
+      // The 10-minute cap, as an absolute deadline. See SessionClock.
+      endsAt: Date.now() + CONFIG.SESSION_SECONDS * 1000,
+      timeExpired: false,
       endedAt: null,
       startingBalance: STATE.balance,
       endingBalance: STATE.balance,
@@ -396,6 +416,8 @@ const Game = {
     Api.startSession(session, ()=>({ ok:true }));
     $("#arenaPreStart").style.display = "none";
     $("#arenaGame").style.display = "block";
+    UI.showArenaArt(false);
+    SessionClock.start();
     Round.begin();
   },
 
@@ -451,6 +473,23 @@ const Game = {
     if(!Round.reviewing) return;
     Round.reviewing = false;
     Round.locked = true;
+
+    /* The stake leaves the balance here, not 25 seconds later when the round
+       resolves. Locking a prediction commits the points, and the countdown keeps
+       running after the lock — so between the two the balance was still showing
+       points that were already spoken for, and the risk grid still offered them
+       for a stake. resolve() returns this escrow before applying the round's
+       payout, so the net movement per round is unchanged: a win still nets
+       +risk×multiplier and a loss still costs exactly the stake. */
+    const stake = Math.max(0, Math.floor(Number(Round.risk) || 0));
+    if(stake > 0){
+      Round.escrow = stake;
+      STATE.balance -= stake;
+      STATE.pendingStake = stake;
+      UI.updateHeaderPoints();
+      UI.updateStatsStrip();
+    }
+
     UI.lockUI();
     saveState();
     AudioHooks.play("predictionLock");
@@ -466,10 +505,23 @@ const Game = {
     });
   },
 
-  endSession(){
-    UI.hideModal();
+  /* Close the books on the live session and archive it. Split out of
+     endSession() because there are now two callers with different endings: the
+     player finishing a run (ceremony, then the summary screen) and a run whose
+     10-minute clock ran out while the tab was closed, which is picked up on the
+     next load and archived with no ceremony at all. Returns the archived session,
+     or null if there wasn't one. */
+  archiveSession(){
     const s = STATE.session;
-    if(!s) return;
+    if(!s) return null;
+    SessionClock.stop();
+    /* Settle any live stake *before* the snapshot below. Ending a session
+       mid-round leaves a locked round whose escrow is still out; reading
+       STATE.balance first would archive the session with a phantom loss, and
+       netResult would be short by the stake for good. Round.resolve() settles
+       again when its timer eventually fires — settleEscrow() is idempotent, so
+       that second call returns nothing. */
+    Round.settleEscrow();
     s.endedAt = Date.now();
     s.endingBalance = STATE.balance;
     s.totalRounds = s.rounds.length;
@@ -477,6 +529,12 @@ const Game = {
     s.netResult = s.endingBalance - s.startingBalance;
 
     s.awards = Awards.calculate(s);
+
+    /* The simulated "how you'd have done in the real campaign" comparison is
+       rolled ONCE, here, and archived with the session. Rolling it in the
+       renderer instead would hand the player a different rank and a different
+       prize every time they reopened the same run from history. */
+    s.campaign = CadeRules.simulateCampaignResult(s);
 
     // Drop the per-round chart arrays before archiving, and keep history bounded.
     // Without this, storage grows without limit for as long as someone plays.
@@ -488,15 +546,40 @@ const Game = {
     saveState();
 
     Api.endSession(s.sessionId, s, ()=>({ ok:true, balance: STATE.balance, records: STATE.records }));
+    return s;
+  },
 
+  endSession(){
+    UI.hideModal();
+    const s = this.archiveSession();
+    if(!s) return;
     AudioHooks.play("sessionEnd");
     Ceremony.run(s);
+  },
+
+  /* A run left open by a closed tab is still bound by its session clock, so on
+     the next load its deadline has usually passed. Archive it instead of leaving
+     it live: a stale session keeps feeding the arena stats strip, and the next
+     START SESSION would overwrite it, losing the rounds the player did play.
+     No ceremony and no navigation — the run is simply recorded where they can
+     find it. Returns true if a session was closed out. */
+  closeExpiredSession(){
+    const s = STATE.session;
+    if(!s || !s.endsAt || Date.now() < s.endsAt) return false;
+    s.timeExpired = true;
+    const archived = this.archiveSession();
+    if(archived && archived.totalRounds > 0){
+      toast("Your last session's " + Math.round(CONFIG.SESSION_SECONDS/60) +
+        " minutes ran out — it's saved in History.");
+    }
+    return !!archived;
   },
 
   playAgain(){
     Nav.go("arena");
     $("#arenaPreStart").style.display = "block";
     $("#arenaGame").style.display = "none";
+    UI.showArenaArt(true);
   },
 
   restartSessionRequest(){
@@ -578,20 +661,48 @@ const Game = {
 const Round = {
   active: false, locked: false, reviewing: false, prediction: null, risk: 0,
   coin: null, outcome: null, timeLeft: CONFIG.ROUND_SECONDS, timerId: null, roundNum: 0,
+  // Points already taken out of STATE.balance for this round. Set when the
+  // prediction locks, returned by settleEscrow() when the round is decided,
+  // abandoned or the session ends. Mirrored into STATE.pendingStake so a reload
+  // can find it. Always the amount actually debited — never re-derived from
+  // this.risk, so a round whose lock was never taken refunds nothing.
+  escrow: 0,
   // The session this round was started for. resolve() checks it against the live
   // session so a round whose session has since ended cannot write into it.
   session: null,
 
+  /* Returns the committed stake to the balance and clears the commitment.
+     Idempotent: the second call refunds 0, so the settle points below can
+     overlap without ever paying a stake back twice. */
+  settleEscrow(){
+    const held = Math.max(0, Math.floor(Number(this.escrow) || 0));
+    this.escrow = 0;
+    STATE.pendingStake = 0;
+    if(held > 0){
+      STATE.balance += held;
+      UI.updateHeaderPoints();
+    }
+    return held;
+  },
+
   async begin(){
     const s = STATE.session;
     if(!s) return; // session was ended before this round could start
+    // The session clock outranks the round clock: with under
+    // SESSION_MIN_ROUND_SECONDS left there is no round worth dealing, so the run
+    // goes to its results instead of opening one that would be cut off.
+    if(!SessionClock.roundFits()){ Game.endSession(); return; }
     this.session = s; // remember which session this round belongs to
     this.roundNum = s.rounds.length + 1;
     this.active = true;
     this.locked = false;
     this.prediction = null;
     this.risk = 0;
-    this.timeLeft = CONFIG.ROUND_SECONDS;
+    this.escrow = 0;
+    /* Normally the full ROUND_SECONDS, but the last round of a session is
+       shortened to whatever the session has left — so "a session lasts 10
+       minutes" is true to the second rather than 10 minutes plus a round. */
+    this.timeLeft = SessionClock.roundSeconds();
     this.coin = MarketEngine.generateCoin();
 
     // Paint the new round immediately. This used to happen *after* awaiting the
@@ -647,9 +758,11 @@ const Round = {
        sets STATE.session to null, so 25 seconds later this ran `s.rounds.push()`
        on null and threw a TypeError that took the arena down with it. A round
        whose session is gone (or has been replaced by a restart) simply has
-       nothing to record: the balance was never debited, so dropping it is the
-       correct outcome, not a silent loss of points. */
+       nothing to record — but the stake was debited at lock time, so it has to be
+       returned here rather than dropped with the round. (endSession() settles it
+       first so the archived endingBalance is right; this call then refunds 0.) */
     if(!s || (this.session && this.session !== s)){
+      this.settleEscrow();
       this.locked = false;
       this.prediction = null;
       this.risk = 0;
@@ -657,6 +770,13 @@ const Round = {
     }
 
     const hasPrediction = this.locked && this.prediction && this.risk > 0;
+    /* Return the committed stake before scoring. The payout below is a *net*
+       delta — +risk×multiplier on a win, −risk on a loss — which is what
+       rules.js scoreRound() returns and what the server and CLI apply too. So
+       stake-back plus net delta lands on exactly the same balance the old
+       resolve-time-only maths produced, with the difference that the points were
+       actually held for the life of the round. */
+    this.settleEscrow();
     // A missing or malformed outcome must not silently score every round a loss,
     // which is what an unexpected server payload used to do: dir came back
     // undefined, never matched UP or DOWN, and the player lost their stake.
@@ -735,8 +855,126 @@ const Round = {
       UI.showRoundResult(roundRecord, s);
     } else {
       toast("Time's up! No prediction made.");
-      setTimeout(()=>Round.begin(), 900);
+      setTimeout(()=>Round.advance(), 900);
     }
+  },
+
+  /* The one way into the next round. Both routes here — the NEXT MEME button and
+     the auto-advance after a skipped round — have to check the session clock
+     first, or a 10-minute session quietly runs forever as long as somebody keeps
+     tapping. */
+  advance(){
+    const root = document.getElementById("resultRoot");
+    if(root) root.innerHTML = "";
+    if(!STATE.session || !SessionClock.roundFits()){
+      Game.endSession();
+      return;
+    }
+    this.begin();
+  }
+};
+
+/* =========================================================
+   SESSION CLOCK
+   -----------------------------------------------------
+   A session is capped at CONFIG.SESSION_SECONDS (10 minutes) so a run reaches
+   its results and awards while they're still worth sharing. This is a second,
+   longer clock sitting above the per-round countdown: ROUND_SECONDS is how long
+   you get to call one coin, SESSION_SECONDS is how long the whole run lasts.
+
+   The deadline is stored on the session as an absolute timestamp rather than
+   counted down in a variable, so a tab that was backgrounded (where setInterval
+   is throttled to once a minute) comes back to the correct remaining time
+   instead of a clock that lost two minutes.
+   ========================================================= */
+const SessionClock = {
+  timerId: null,
+
+  start(){
+    this.stop();
+    this.render();
+    this.timerId = setInterval(()=>this.tick(), 1000);
+  },
+
+  stop(){
+    clearInterval(this.timerId);
+    this.timerId = null;
+  },
+
+  remainingMs(){
+    const s = STATE.session;
+    if(!s || !s.endsAt) return 0;
+    return Math.max(0, s.endsAt - Date.now());
+  },
+
+  expired(){
+    const s = STATE.session;
+    if(!s) return false;
+    if(!s.endsAt) return false; // a session archived before this clock existed
+    return Date.now() >= s.endsAt;
+  },
+
+  /* Whether there's enough time left to be worth dealing another coin. Below the
+     floor the run goes to its results rather than opening a round that the
+     session clock would cut off after a couple of seconds. */
+  roundFits(){
+    const s = STATE.session;
+    if(!s) return false;
+    if(!s.endsAt) return true;
+    return this.remainingMs() >= CONFIG.SESSION_MIN_ROUND_SECONDS * 1000;
+  },
+
+  /** Seconds a round starting right now can actually run for. */
+  roundSeconds(){
+    const s = STATE.session;
+    if(!s || !s.endsAt) return CONFIG.ROUND_SECONDS;
+    return Math.max(1, Math.min(CONFIG.ROUND_SECONDS, Math.floor(this.remainingMs()/1000)));
+  },
+
+  format(ms){
+    const total = Math.max(0, Math.ceil(ms/1000));
+    return Math.floor(total/60) + ":" + String(total%60).padStart(2,"0");
+  },
+
+  render(){
+    const el = document.getElementById("sessionClock");
+    if(!el) return;
+    const ms = this.remainingMs();
+    el.textContent = "SESSION " + this.format(ms);
+    el.classList.toggle("urgent", ms > 0 && ms <= 60000);
+  },
+
+  tick(){
+    this.render();
+    if(this.expired()) this.timeUp();
+  },
+
+  /* Time's up. A round that's already locked is still resolved — the stake is
+     committed and the outcome was rolled before the clock ran out, so cancelling
+     it would be taking a prediction off the player. That resolve() shows its
+     result card as usual, and because the clock has expired the card's button
+     reads SEE FINAL RESULT and routes to the summary instead of dealing again.
+     An unlocked round is scored SKIPPED, which auto-advances down the same path.
+     Nothing in flight means the player is sitting on a result card already, so
+     go straight there. */
+  timeUp(){
+    this.stop();
+    const s = STATE.session;
+    if(!s) return;
+    if(s.timeExpired) return; // already handled
+    s.timeExpired = true;
+    this.render();
+    toast("TIME! That's the " + this.format(CONFIG.SESSION_SECONDS*1000) + " — final result coming up.");
+    if(Round.active){
+      clearInterval(Round.timerId);
+      Round.timeLeft = 0;
+      UI.updateTimerDisplay(0);
+      Round.resolve();
+      return;
+    }
+    // Nothing in flight: the player is sitting on a result card, so clear it and
+    // go straight to the summary.
+    Round.advance();
   }
 };
 
@@ -1197,6 +1435,14 @@ const UI = {
     $("#headerPoints").textContent = fmt(STATE.balance);
   },
 
+  // The arena art belongs to the pre-start view, so it hides when a session
+  // starts and comes back on PLAY AGAIN — the two places #arenaPreStart itself
+  // is toggled.
+  showArenaArt(show){
+    const el = document.getElementById("arenaArtSlot");
+    if(el) el.style.display = show ? "flex" : "none";
+  },
+
   renderHome(){
     this.updateHeaderPoints();
     this.renderClaimPanel();
@@ -1465,7 +1711,7 @@ const UI = {
         <div class="result-stat"><span>${win?'RISK':'RISK'}</span><span>${fmt(round.riskAmount)}</span></div>
         <div class="result-stat"><span>${win?'PROFIT':'LOSS'}</span><span id="resultPayout">${win?'+':'-'}${fmt(round.payout)}</span></div>
         <div class="result-stat"><span>NEW BALANCE</span><span id="resultBalance">${fmt(balanceBefore)}</span></div>
-        <button class="btn btn-primary btn-block mt16" onclick="UI.nextRound()">NEXT MEME →</button>
+        <button class="btn btn-primary btn-block mt16" onclick="Round.advance()">${SessionClock.roundFits() ? 'NEXT MEME →' : 'SEE FINAL RESULT →'}</button>
       </div>`;
     root.appendChild(overlay);
     if(win){
@@ -1485,9 +1731,11 @@ const UI = {
     }
   },
 
+  /* Kept as a thin alias: Round.advance() is the real entry point (it checks the
+     session clock before dealing another coin), and older markup or a stale
+     cached page may still call this. */
   nextRound(){
-    $("#resultRoot").innerHTML = "";
-    Round.begin();
+    Round.advance();
   },
 
   renderLeaderboard(){
@@ -1541,7 +1789,11 @@ const UI = {
         used.add(c[0]);
         coins.push({ ticker:c[0], emoji:c[1], votes: randInt(50,900) });
       }
-      STATE.votes = { endsAt: Date.now()+60*60*1000, coins, voted:false };
+      // Window length comes from CONFIG (10 minutes) rather than a literal here.
+      // It used to be a hard-coded hour, written out again in cli.js — two copies
+      // of one tunable, which is how the vote closed at different times
+      // depending on which front end you opened it in.
+      STATE.votes = { endsAt: Date.now()+CONFIG.VOTE_WINDOW_MS, coins, voted:false };
       saveState();
     }
     clearInterval(this._voteInterval);
@@ -1672,7 +1924,59 @@ const UI = {
       <div class="award-chip-row">
         ${awardsOf(s).length ? awardsOf(s).map(a=>`<span class="award-chip">${a.icon} ${a.title}</span>`).join("") : '<span class="muted">No awards this run — try again!</span>'}
       </div>`;
+    this.renderCampaignSim(s);
     STATE._lastViewed = s;
+  },
+
+  /* "How you'd have done in the real Cade Meme Madness" — the simulated
+     comparison against the real campaign's daily prize table.
+
+     Everything here is illustrative and the markup says so twice: a SIMULATED
+     badge on the heading and the full CadeRules.CAMPAIGN_DISCLAIMER underneath.
+     A dollar figure on a results screen reads as a promise unless it is fenced
+     that plainly, and this prototype has no connection to cade.market. */
+  renderCampaignSim(s){
+    const root = document.getElementById("campaignSimRoot");
+    if(!root) return;
+    if(!s){ root.innerHTML = ""; return; }
+
+    /* Rolled at endSession() and archived with the session, so reopening a run
+       from history shows the same rank. Sessions archived before this existed get
+       one rolled on first view and stored, rather than a fresh one each time. */
+    if(!s.campaign){
+      s.campaign = CadeRules.simulateCampaignResult(s);
+      saveState();
+    }
+    const c = s.campaign;
+    const lines = CadeRules.campaignResultLines(c);
+    const prizeStr = c.placed ? "$" + fmt(c.prizeUsd) : "NO PRIZE";
+
+    root.innerHTML = `
+      <div class="campaign-sim card">
+        <div class="campaign-head">
+          <h3>IF THIS WERE THE REAL CAMPAIGN</h3>
+          <span class="sim-badge">SIMULATED</span>
+        </div>
+        <div class="campaign-rank">
+          <div class="box">
+            <div class="v">#${c.rank}</div>
+            <div class="muted">SIMULATED RANK OF ${fmt(c.fieldSize)}</div>
+          </div>
+          <div class="box ${c.placed?'paid':''}">
+            <div class="v">${prizeStr}</div>
+            <div class="muted">${c.placed ? c.tierLabel + " PRIZE TIER" : "OUTSIDE THE TOP " + c.paidRanks}</div>
+          </div>
+        </div>
+        <p class="campaign-headline">${lines.headline}</p>
+        ${lines.quests.length ? `<div class="campaign-quests">
+          <div class="campaign-quests-title">SIDE QUESTS YOU'D BE IN THE RUNNING FOR</div>
+          ${c.quests.map((q,i)=>`<div class="campaign-quest">
+            <span class="campaign-quest-icon">${q.icon}</span>
+            <span class="campaign-quest-text">${lines.quests[i]}<span class="muted small block">${q.detail}</span></span>
+          </div>`).join("")}
+        </div>` : `<p class="muted small">No Side Quest in reach this run — more predictions or a bigger single hit would put one in play.</p>`}
+        <p class="campaign-disclaimer">${c.disclaimer}</p>
+      </div>`;
   },
 
   /* Modals were dismissable only by their own CANCEL button. Escape did nothing,
@@ -1736,6 +2040,25 @@ const UI = {
   if(logoSlot) logoSlot.innerHTML = AssetManager.slot("logo", AssetManager.paths.logo, "🐸", "");
   const heroSlot = document.getElementById("heroArtSlot");
   if(heroSlot) heroSlot.innerHTML = AssetManager.slot("hero", AssetManager.paths.hero, "🐸💥🚀", "hero-art-slot");
+  // Arena pre-start art (above the READY FOR MADNESS? card). Same asset and the
+  // same emoji fallback as the home hero — drop a file at AssetManager.paths.hero
+  // and both slots pick it up.
+  const arenaArtSlot = document.getElementById("arenaArtSlot");
+  if(arenaArtSlot) arenaArtSlot.innerHTML = AssetManager.slot("arenaHero", AssetManager.paths.hero, "🐸💥🚀", "");
+
+  /* State the session length from CONFIG rather than in the markup, so the copy
+     and the clock that enforces it cannot disagree. */
+  const arenaSessionNote = document.getElementById("arenaSessionNote");
+  if(arenaSessionNote){
+    const mins = Math.round(CONFIG.SESSION_SECONDS/60);
+    arenaSessionNote.textContent = "⏱ " + mins + "-MINUTE SESSION · " + CONFIG.ROUND_SECONDS +
+      "s PER ROUND · RESULTS & AWARDS AT THE BUZZER";
+  }
+
+  /* A run whose 10 minutes elapsed while the tab was closed is archived now
+     rather than resumed. Must run after Game/SessionClock are defined, which is
+     why it's here and not in loadState(). */
+  Game.closeExpiredSession();
 
   // #8 — one global tap sound for every button, instead of wiring each
   // handler individually. Silent no-op until unmuted / files exist.

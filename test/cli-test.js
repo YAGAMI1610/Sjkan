@@ -903,6 +903,48 @@ check("win rate never exceeds 100% (the operator-precedence bug)", () => {
   for (const p of perfect) eq(Math.round(p.winRate), 100, p.name + " went " + p.wins + "-0 but shows " + p.winRate + "%");
 });
 
+check("every box closes at the same column, emoji included", () => {
+  /* box() pads with pad()/width(), and width() has to know that an emoji occupies
+     two terminal columns. It counted ⭐ (U+2B50, outside the ranges it checked) as
+     one, so the MEME STAR row's right border sat a column further out than every
+     other row. Measured here with \p{Extended_Pictographic} rather than a copy of
+     cli.js's ranges, so this stays an independent check of the same claim. */
+  const displayWidth = str => {
+    let w = 0;
+    for (const ch of str) {
+      const cp = ch.codePointAt(0);
+      if (cp === 0xFE0F || cp === 0x200D) continue;
+      w += /\p{Extended_Pictographic}/u.test(ch) ? 2 : 1;
+    }
+    return w;
+  };
+  const save = newSave("box-frame");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  for (let i = 0; i < 16; i++) {
+    const r = json(["round", "--predict", i % 3 ? "UP" : "DOWN", "--risk", "2000", "--seed", String(1600 + i), "--data", save]);
+    if (r.body.ok === false) break;
+  }
+  const out = run(["session", "end", "--data", save]).stdout +
+    run(["status", "--data", save]).stdout +
+    run(["records", "--data", save]).stdout +
+    run(["history", "--data", save]).stdout +
+    run(["leaderboard", "--data", save]).stdout +
+    run(["share", "--data", save]).stdout;
+  const framed = out.split("\n").filter(l => /^[┌│└├]/.test(l.trim()));
+  assert(framed.length > 20, "only " + framed.length + " framed lines to check");
+  const widths = new Map();
+  for (const line of framed) {
+    const w = displayWidth(line.trim());
+    widths.set(w, (widths.get(w) || 0) + 1);
+  }
+  assert(widths.size === 1,
+    "box rows disagree on width: " + [...widths.entries()].map(([w, n]) => w + "col ×" + n).join(", ") +
+    "\n      " + framed.filter(l => displayWidth(l.trim()) !== [...widths.keys()].sort((a, b) => widths.get(b) - widths.get(a))[0])
+      .slice(0, 3).map(l => JSON.stringify(l)).join("\n      "));
+  return framed.length + " rows, all " + [...widths.keys()][0] + " columns";
+});
+
 check("history --id returns that exact session", () => {
   const save = newSave("history-id");
   json(["claim", "--data", save]);
@@ -1081,11 +1123,14 @@ group("10. The CLI cannot drift from the browser build");
 check("cli.js sources its rules from rules.js and re-declares none of them", () => {
   const src = fs.readFileSync(CLI, "utf8");
   assert(/require\(["']\.\/rules\.js["']\)/.test(src), "cli.js does not require ./rules.js");
-  const decl = /(?:const|let|var)\s+(OUTCOMES|COIN_POOL|AWARD_DEFS|SIM_PLAYERS_BASE|RISK_TIERS)\s*=\s*[[{]/;
+  const decl = /(?:const|let|var)\s+(OUTCOMES|COIN_POOL|AWARD_DEFS|SIM_PLAYERS_BASE|RISK_TIERS|PRIZE_TIERS|SIDE_QUESTS)\s*=\s*[[{]/;
   assert(!decl.test(src), "cli.js declares its own copy of " + (src.match(decl) || [])[1] +
     " — that is exactly how the ±18% / ±40% divergence happened");
-  const nums = /(?:PAYOUT_MULTIPLIER|DAILY_POINTS|DYNAMIC_COIN_CHANCE|ROUND_SECONDS)\s*:\s*[\d.]/;
+  const nums = /(?:PAYOUT_MULTIPLIER|DAILY_POINTS|DYNAMIC_COIN_CHANCE|ROUND_SECONDS|SESSION_SECONDS|VOTE_WINDOW_MS)\s*:\s*[\d.]/;
   assert(!nums.test(src), "cli.js hard-codes a tunable that belongs in rules.js");
+  // The vote window was a literal hour in both front ends before it moved into
+  // CONFIG. Two copies of one duration is how they came to disagree.
+  assert(!/60\s*\*\s*60\s*\*\s*1000/.test(src), "cli.js hard-codes the vote window instead of using CONFIG.VOTE_WINDOW_MS");
 });
 
 check("the CLI is excluded from the Vercel deployment", () => {
@@ -1115,6 +1160,176 @@ check("every coin dealt comes from the shared pool or is a generated one", () =>
     if (!c.emoji) strays.push(c.ticker + " has no emoji");
   }
   assert(strays.length === 0, "coin(s) not traceable to rules.js: " + strays.join(", "));
+});
+
+/* ---------------------------------------------------------
+   11. The ten-minute session clock and the campaign comparison
+   --------------------------------------------------------- */
+group("11. Session clock and campaign comparison");
+
+/** Reach into a save file and move a live session's deadline. Nothing in the CLI
+ *  can wait ten real minutes, and a `--now` test flag would be a production
+ *  surface that exists only for the suite. */
+function expireSession(save, msFromNow) {
+  const data = JSON.parse(fs.readFileSync(save, "utf8"));
+  assert(data.session, "no live session in " + save);
+  data.session.endsAt = Date.now() + (msFromNow || 0);
+  fs.writeFileSync(save, JSON.stringify(data));
+  return data.session;
+}
+
+check("a new session carries a ten-minute deadline", () => {
+  const save = newSave("clock-start");
+  json(["claim", "--data", save]);
+  const started = json(["session", "start", "--data", save]).body;
+  const data = JSON.parse(fs.readFileSync(save, "utf8"));
+  assert(data.session.endsAt, "the session was written with no endsAt deadline");
+  eq(data.session.timeExpired, false, "a fresh session is flagged expired");
+  const span = data.session.endsAt - data.session.startedAt;
+  eq(span, CONFIG.SESSION_SECONDS * 1000, "deadline is " + span + "ms out");
+  assert(started.sessionId, "no sessionId returned");
+  return CONFIG.SESSION_SECONDS / 60 + " minutes, stored as an absolute deadline";
+});
+
+check("status reports the clock, and both sides agree it is up", () => {
+  const save = newSave("clock-status");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  const live = json(["status", "--data", save]).body.session;
+  assert(live.msLeft > CONFIG.SESSION_SECONDS * 1000 - 5000 && live.msLeft <= CONFIG.SESSION_SECONDS * 1000,
+    "msLeft is " + live.msLeft + ", expected just under " + CONFIG.SESSION_SECONDS * 1000);
+  eq(live.timeUp, false, "a fresh session reports time up");
+
+  // Human output has to say it too — a script reads msLeft, a player reads this.
+  const human = run(["status", "--data", save]);
+  assert(/time left/.test(human.stdout), "the human status hides the session clock");
+  assert(new RegExp("of " + Math.round(CONFIG.SESSION_SECONDS / 60) + " minutes").test(human.stdout),
+    "the human status does not say how long a run is: " + human.stdout.slice(0, 200));
+
+  expireSession(save, -1000);
+  const dead = json(["status", "--data", save]).body.session;
+  eq(dead.timeUp, true, "an expired session does not report time up");
+  eq(dead.msLeft, 0, "msLeft went negative");
+  assert(/time up/.test(run(["status", "--data", save]).stdout), "the human status does not say time is up");
+  return "msLeft " + Math.round(live.msLeft / 1000) + "s → 0s";
+});
+
+check("a round after the buzzer is refused and changes nothing", () => {
+  const save = newSave("clock-refuse");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  json(["round", "--predict", "UP", "--risk", "1000", "--seed", "7", "--data", save]);
+  expireSession(save, -1);
+  const before = json(["status", "--data", save]).body;
+
+  const r = json(["round", "--predict", "UP", "--risk", "1000", "--data", save]);
+  eq(r.code, 1, "a post-deadline round did not exit 1");
+  eq(r.body.error, "session-time-up");
+  eq(r.body.sessionId, before.session.sessionId, "the refusal names the wrong session");
+  const after = json(["status", "--data", save]).body;
+  eq(after.balance, before.balance, "the refused round still moved the balance");
+  eq(after.session.rounds, before.session.rounds, "the refused round was recorded anyway");
+
+  // Refused, not stuck: `session end` is still the way out, and it works.
+  const human = run(["round", "--predict", "UP", "--risk", "1000", "--data", save]);
+  eq(human.code, 1);
+  assert(/session end/.test(human.stdout + human.stderr),
+    "the refusal does not tell the player how to get their results");
+  eq(json(["session", "end", "--data", save]).code, 0, "an expired session cannot be ended");
+  return "exit 1, ledger untouched, `session end` still open";
+});
+
+check("`session end` carries a campaign comparison, and it is stable", () => {
+  const save = newSave("campaign-json");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  for (let i = 0; i < 3; i++) {
+    json(["round", "--predict", "UP", "--risk", "1000", "--seed", String(900 + i), "--data", save]);
+  }
+  const s = json(["session", "end", "--data", save]).body.session;
+  const c = s.campaign;
+  assert(c, "the archived session carries no campaign comparison");
+  eq(c.campaign, Rules.CAMPAIGN_NAME);
+  eq(c.simulated, true, "the comparison is not flagged as simulated");
+  eq(c.score, s.netResult, "the comparison ranks a different number than the session's net");
+  eq(c.fieldSize, Rules.CAMPAIGN_ENTRANTS);
+  eq(c.paidRanks, Rules.PRIZE_FIELD_SIZE);
+  assert(c.rank >= 1 && c.rank <= c.fieldSize, "rank " + c.rank + " is outside the field");
+  eq(c.placed, c.prizeUsd > 0, "placed and prizeUsd disagree");
+  eq(c.prizeUsd, (Rules.prizeForRank(c.rank) || { usd: 0 }).usd, "the prize does not match the tier table");
+  eq(c.disclaimer, Rules.CAMPAIGN_DISCLAIMER, "the CLI stores a paraphrased disclaimer");
+
+  // Archived once, so `history` and a re-read report the same rank and prize.
+  const fromFile = JSON.parse(fs.readFileSync(save, "utf8")).history[0].campaign;
+  eq(fromFile.rank, c.rank, "the persisted rank differs from the one reported");
+  eq(fromFile.prizeUsd, c.prizeUsd, "the persisted prize differs from the one reported");
+  return "rank #" + c.rank + " of " + c.fieldSize + (c.placed ? " → $" + c.prizeUsd : " → no prize");
+});
+
+check("the summary prints the comparison, the badge and the whole disclaimer", () => {
+  const save = newSave("campaign-human");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  for (let i = 0; i < 3; i++) {
+    json(["round", "--predict", "UP", "--risk", "1000", "--seed", String(950 + i), "--data", save]);
+  }
+  const out = run(["session", "end", "--data", save]).stdout;
+  assert(/IF THIS WERE THE REAL CAMPAIGN/.test(out), "the campaign box is missing from the summary");
+  assert(/SIMULATED/.test(out), "the SIMULATED label is missing");
+  assert(/simulated rank\s+#\d+ of \d+ generated entrants/.test(out),
+    "the rank line is missing or reworded: " + out.slice(-900));
+  assert(/If you performed like this in the real CADE Meme Madness/.test(out.replace(/\s+/g, " ")),
+    "the headline sentence is missing");
+  // The disclaimer is wrapped across lines, so compare on collapsed whitespace.
+  const flat = out.replace(/[│|]/g, " ").replace(/\s+/g, " ");
+  assert(flat.indexOf(Rules.CAMPAIGN_DISCLAIMER.replace(/\s+/g, " ")) !== -1,
+    "the full disclaimer is not printed next to the prize figure");
+  assert(!ANSI.test(out), "the campaign box leaks ANSI into a pipe");
+  return "box, badge and " + Rules.CAMPAIGN_DISCLAIMER.length + "-char disclaimer all present";
+});
+
+check("no line of the campaign box breaks the frame", () => {
+  /* box() pads to a fixed width and never truncates, so an unwrapped sentence
+     pushes the right border out and the whole report looks broken. */
+  const save = newSave("campaign-frame");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  for (let i = 0; i < 14; i++) {
+    const r = json(["round", "--predict", i % 2 ? "UP" : "DOWN", "--risk", "5000", "--seed", String(1200 + i), "--data", save]);
+    if (r.body.ok === false) break;
+  }
+  const out = run(["session", "end", "--data", save]).stdout;
+  const start = out.indexOf("IF THIS WERE THE REAL CAMPAIGN");
+  assert(start !== -1, "the campaign box did not render");
+  const boxLines = out.slice(start).split("\n").filter(l => l.indexOf("│") !== -1);
+  assert(boxLines.length > 3, "only " + boxLines.length + " framed lines");
+  // Emoji are double-width in a terminal but one code point to String.length, so
+  // measure against the widest line rather than a hard-coded column.
+  const widths = boxLines.map(l => l.replace(/[^\x20-\x7E│─┌┐└┘🔥💥·—’…]/gu, "").length);
+  const ragged = boxLines.filter(l => !/│\s*$/.test(l) && !/│[^│]*│\s*$/.test(l));
+  assert(ragged.length === 0, "line(s) escaped the frame:\n      " + ragged.slice(0, 3).join("\n      "));
+  return boxLines.length + " framed lines, max " + Math.max.apply(null, widths) + " printable cols";
+});
+
+check("a session with 12+ predictions reaches The Grinder Quest wording", () => {
+  const save = newSave("campaign-grinder");
+  json(["claim", "--data", save]);
+  json(["session", "start", "--data", save]);
+  let calls = 0;
+  const need = Rules.SIDE_QUESTS.GRINDER_QUEST.minPredictions;
+  for (let i = 0; i < need + 6 && calls < need; i++) {
+    const r = json(["round", "--predict", "UP", "--risk", "100", "--seed", String(1400 + i), "--data", save]);
+    if (r.body.ok === false) break;
+    calls++;
+  }
+  eq(calls, need, "could not make " + need + " predictions on a 100-point stake");
+  const body = json(["session", "end", "--data", save]).body.session.campaign;
+  const grinder = body.quests.filter(q => q.id === "GRINDER_QUEST")[0];
+  assert(grinder, need + " predictions did not reach The Grinder Quest");
+  eq(grinder.usd, 400);
+  const out = run(["history", "--data", save]).stdout; // archived, so re-readable
+  assert(out.length > 0);
+  return need + " predictions → " + grinder.title + " ($" + grinder.usd + ")";
 });
 
 /* =====================================================

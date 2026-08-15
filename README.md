@@ -56,11 +56,11 @@ test:cli` asserts that against `Rules.scoreRound()` round by round.
 ## Test it
 ```bash
 npm install            # jsdom, for the UI harness
-npm test               # lint + all four suites — 218 checks
-npm run test:ui        # jsdom UI/gameplay smoke test (78 checks)
-npm run test:server    # server contract test (42 checks)
+npm test               # lint + all four suites — 255 checks
+npm run test:ui        # jsdom UI/gameplay smoke test (106 checks)
+npm run test:server    # server contract test (43 checks)
 npm run test:deploy    # Vercel build/deploy test (19 checks)
-npm run test:cli       # CLI production QA (79 checks)
+npm run test:cli       # CLI production QA (87 checks)
 npm run lint           # node --check over every JS entry point
 ```
 
@@ -145,11 +145,41 @@ the UI layer.
   ticks down live and swaps itself back to the claim button when the window
   reopens.
 - Boost actions for bonus points (`Game.doBoost`)
+- **A run lasts 10 minutes.** `CONFIG.SESSION_SECONDS` (600) caps the whole
+  session so results, awards and the share card arrive while they're still worth
+  sharing; `CONFIG.ROUND_SECONDS` (25) is unchanged and is still how long you get
+  to call one coin. The two clocks are separate: the arena header shows
+  `SESSION 10:00` counting down next to the per-round timer.
+  - The deadline is stored on the session as an absolute timestamp, not counted
+    down in a variable, so a backgrounded tab (where `setInterval` is throttled to
+    once a minute) comes back to the right remaining time instead of a clock that
+    lost two minutes. The CLI stores the same field, so a resumed run is still
+    bound by the clock it started under.
+  - The last round shortens to whatever the session has left, so "10 minutes" is
+    true to the second, and below `SESSION_MIN_ROUND_SECONDS` no further coin is
+    dealt — the run goes to its results instead.
+  - A prediction already locked when the buzzer goes is still resolved: the stake
+    is committed and the outcome was rolled before time ran out. Its result card
+    is the last thing shown and its button reads SEE FINAL RESULT.
+  - A run left open by a closed tab is archived on the next load
+    (`Game.closeExpiredSession`), and `node cli.js round` refuses with
+    `session-time-up` (exit 1) once the deadline has passed.
 - Each round: 25s timer, pick UP/DOWN, pick a risk amount, see your risk /
   potential profit / potential loss side by side, confirm (locks in)
-- Payout config lives in `CONFIG` at the top of `app.js`:
+- **Locking a prediction commits the stake immediately** — it leaves your balance
+  at the lock, not 25 seconds later when the round resolves, so the header never
+  offers points that are already spoken for. The stake comes back when the round
+  settles, and the round's payout is applied on top: a win still nets
+  `risk × 1.8` and a loss still costs exactly the stake. If a session is ended or
+  restarted mid-round, or the tab is reloaded while a prediction is locked, the
+  committed stake is returned rather than lost.
+- Payout and duration config lives in `CONFIG` at the top of `rules.js`, which all
+  three front ends read (the browser aliases it as `CadeRules.CONFIG`):
   - `PAYOUT_MULTIPLIER` (default flat 1.8x — a 1,000 stake wins +1,800)
   - `USE_TIERED_PAYOUT` + `RISK_TIERS` for tiered multipliers (1.5x / 1.8x / 2.0x) — flip the flag to switch models
+  - `ROUND_SECONDS` (25) per decision, `SESSION_SECONDS` (600) per run,
+    `SESSION_MIN_ROUND_SECONDS` (5) as the floor below which no further round is
+    dealt, `VOTE_WINDOW_MS` (10 min) for the community vote window
 - Hidden market outcome is generated independently of the user's prediction
   (`MarketEngine.generateOutcome`). Its direction is derived from the sign of
   the percentage move, so an "UP" row with a negative % is unrepresentable.
@@ -159,6 +189,29 @@ the UI layer.
 - Full session object tracked per `sessionId`, saved to `history[]` on `END SESSION`
 - Awards auto-calculated from session stats (`Awards.calculate`)
 - Animated 9-screen award ceremony (`Ceremony.run`) with sequential badge reveals + confetti
+- **"If this were the real campaign" panel** on the end-of-session summary (and in
+  the CLI's `session end` output). It ranks the run's net credits against a
+  simulated field and reports the daily prize tier that rank would sit in —
+  `rules.js` holds the tier table (`PRIZE_TIERS`: $2,000 / $1,200 / $800 / $600 /
+  $500 / $300 for 6th–10th / $120 / $50 / $20 down to 100th) and the two Side
+  Quests (`SIDE_QUESTS`: The Grinder, $400, for volume; The Smasher, $400, for the
+  biggest single multiple).
+  - Every rival in the field is invented and then scored through the same
+    `scoreRound()` the player's own rounds go through, so the field is on the same
+    scale by construction and cannot drift if `PAYOUT_MULTIPLIER` or `RISK_TIERS`
+    change (`CadeRules.simulateRivalScores`).
+  - The field (`CAMPAIGN_ENTRANTS`, 150) is deliberately larger than the paying cut
+    (`PRIZE_FIELD_SIZE`, 100): a 100-entrant field against a table that pays to
+    100th means everybody places and "you wouldn't have placed in the top 100" can
+    never be shown.
+  - Rolled **once**, when the session is archived, and stored on the session — so
+    reopening the same run from history shows the same rank and the same figure.
+  - **It is a simulation and the UI says so twice**: a SIMULATED badge on the
+    heading and `CAMPAIGN_DISCLAIMER` printed verbatim underneath. Nothing here is
+    affiliated with, endorsed by or connected to cade.market, no rival is a real
+    entrant, and no prize is real, offered, payable or guaranteed. The suites
+    assert the disclaimer sits next to the figure, because a dollar amount on a
+    results screen reads as a promise without it.
 - Shareable result card + "Share on X" intent link + copy-to-clipboard
 - Simulated AI leaderboard that ticks during play (`Leaderboard`)
 - Everything persists in `localStorage` under key `cade_meme_madness_v1`

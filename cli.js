@@ -21,6 +21,10 @@
      - The 25-second round timer is a *decision* window, exactly as in the app:
        you have ROUND_SECONDS to choose a direction and a stake, and a round you
        don't answer in time resolves as SKIPPED. It is not a 25-second wait.
+     - A whole run is capped at CONFIG.SESSION_SECONDS (10 minutes), the app's
+       cap too. The deadline is stored on the session, so a run resumed in a
+       later invocation is still bound by the clock it started with: `round`
+       refuses once it's up, and `play` goes to the summary.
 
    Every command runs non-interactively too (`--json` prints one machine-readable
    object and nothing else), which is what makes the production QA suite in
@@ -160,7 +164,12 @@ function width(str) {
   for (const ch of bare) {
     const cp = ch.codePointAt(0);
     if (cp === 0xFE0F || cp === 0x200D) continue;                 // variation selector / ZWJ
-    if (cp >= 0x1F300 || (cp >= 0x2600 && cp <= 0x27BF)) w += 2;  // emoji & symbols
+    // Emoji occupy two columns. The ranges below are the ones this app's icons
+    // actually land in: the main emoji planes, Misc Symbols/Dingbats, and the
+    // four double-width members of Misc Symbols & Arrows — ⭐ lives there, and
+    // being counted as one column pushed the MEME STAR row's border out by one.
+    if (cp >= 0x1F300 || (cp >= 0x2600 && cp <= 0x27BF) ||
+        cp === 0x2B1B || cp === 0x2B1C || cp === 0x2B50 || cp === 0x2B55) w += 2;
     else w += 1;
   }
   return w;
@@ -327,6 +336,12 @@ const Game = {
       sessionId: uid("sess"),
       userId: STATE.userId,
       startedAt: Date.now(),
+      // The session is capped at CONFIG.SESSION_SECONDS, same as the browser's.
+      // Stored as an absolute deadline so it survives the process exiting: the
+      // CLI's `round` command is a separate invocation each time, and a run
+      // resumed from the save file has to be bound by the clock it started with.
+      endsAt: Date.now() + CONFIG.SESSION_SECONDS * 1000,
+      timeExpired: false,
       endedAt: null,
       startingBalance: STATE.balance,
       endingBalance: STATE.balance,
@@ -342,6 +357,25 @@ const Game = {
     return { ok: true, session: STATE.session };
   },
 
+  /** Milliseconds left on the live session's clock. 0 when there's no session,
+   *  and Infinity for a run started before the clock existed. */
+  sessionMsLeft() {
+    const s = STATE.session;
+    if (!s) return 0;
+    if (!s.endsAt) return Infinity;
+    return Math.max(0, s.endsAt - Date.now());
+  },
+
+  sessionExpired() {
+    const s = STATE.session;
+    return !!(s && s.endsAt && Date.now() >= s.endsAt);
+  },
+
+  /** Whether there's time left to be worth dealing another round. */
+  sessionRoundFits() {
+    return this.sessionMsLeft() >= CONFIG.SESSION_MIN_ROUND_SECONDS * 1000;
+  },
+
   endSession() {
     const s = STATE.session;
     if (!s) return { ok: false, error: "no-session" };
@@ -351,6 +385,10 @@ const Game = {
     s.winRate = s.totalRounds ? (s.wins / s.totalRounds * 100) : 0;
     s.netResult = s.endingBalance - s.startingBalance;
     s.awards = Rules.calculateAwards(s);
+    /* Rolled once, here, and archived with the session — so `cade history --id`
+       replays the same simulated rank rather than rerolling it, and the CLI and
+       the browser agree about a run they both saved. */
+    s.campaign = Rules.simulateCampaignResult(s);
 
     if (Array.isArray(s.rounds)) s.rounds.forEach(trimRoundForStorage);
     STATE.history.unshift(s);
@@ -576,6 +614,60 @@ function renderSessionSummary(s) {
     blank();
     box("AWARDS EARNED", awards.map(a => `${a.icon}  ${C.bold}${a.title}${C.reset} ${C.grey}— ${a.desc}${C.reset}`));
   }
+  renderCampaignSim(s);
+}
+
+/* "How you'd have done in the real Cade Meme Madness" — the same simulated
+   comparison the browser summary shows, from the same rules.js functions, so the
+   two front ends never quote different ranks for one archived run.
+
+   The heading says SIMULATED and the disclaimer is printed every time. That is
+   not optional politeness: a dollar figure in a results box reads as a payout
+   unless the sentence next to it says otherwise, and nothing here is connected to
+   the real campaign. */
+function renderCampaignSim(s) {
+  const c = s && s.campaign;
+  if (!c) return;
+  const lines = Rules.campaignResultLines(c);
+  const rows = [
+    `${C.grey}simulated rank${C.reset}   ${C.bold}#${c.rank}${C.reset}${C.grey} of ${fmt(c.fieldSize)} generated entrants${C.reset}`,
+    `${C.grey}prize tier${C.reset}       ` + (c.placed
+      ? `${C.yellow}${C.bold}$${fmt(c.prizeUsd)}${C.reset}${C.grey} — ${c.tierLabel}${C.reset}`
+      : `${C.grey}none — outside the top ${c.paidRanks}${C.reset}`),
+    "",
+    ...wrapText(lines.headline, BOX_W - 6).map(l => `${C.bold}${l}${C.reset}`)
+  ];
+  if (lines.quests.length) {
+    rows.push("");
+    rows.push(`${C.grey}side quests${C.reset}`);
+    lines.quests.forEach((q, i) => {
+      // The icon prefix is two columns wide plus two spaces, so the text wraps
+      // narrower than the plain rows above to leave room for it.
+      wrapText(q, BOX_W - 10).forEach((l, li) => {
+        rows.push((li === 0 ? c.quests[i].icon + "  " : "   ") + l);
+      });
+      rows.push(`   ${C.grey}${c.quests[i].detail}${C.reset}`);
+    });
+  }
+  rows.push("");
+  wrapText(lines.disclaimer, BOX_W - 6).forEach(l => rows.push(`${C.grey}${l}${C.reset}`));
+  blank();
+  box("IF THIS WERE THE REAL CAMPAIGN · SIMULATED", rows);
+}
+
+/* Greedy word wrap. The box() helper pads to the longest line, so long prose has
+   to be broken up here or it blows the frame out past the terminal width. */
+function wrapText(text, width) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const out = [];
+  let line = "";
+  for (const w of words) {
+    if (!line) { line = w; continue; }
+    if ((line + " " + w).length > width) { out.push(line); line = w; }
+    else line += " " + w;
+  }
+  if (line) out.push(line);
+  return out.length ? out : [""];
 }
 
 /* =========================================================
@@ -769,7 +861,9 @@ Commands.status = function () {
     boosts: STATE.boosts,
     session: s ? {
       sessionId: s.sessionId, rounds: s.rounds.length, wins: s.wins, losses: s.losses,
-      currentStreak: s.currentStreak, netSoFar: STATE.balance - s.startingBalance
+      currentStreak: s.currentStreak, netSoFar: STATE.balance - s.startingBalance,
+      msLeft: Number.isFinite(Game.sessionMsLeft()) ? Game.sessionMsLeft() : null,
+      timeUp: Game.sessionExpired()
     } : null,
     sessionsPlayed: STATE.history.length,
     dataFile: DATA_FILE
@@ -788,6 +882,12 @@ Commands.status = function () {
     lines.push(`${C.grey}live run${C.reset}     round ${s.rounds.length + 1} · ` +
       `${C.green}${s.wins}W${C.reset}/${C.red}${s.losses}L${C.reset} · streak ${s.currentStreak} · ` +
       `net ${signed(STATE.balance - s.startingBalance)}`);
+    const left = Game.sessionMsLeft();
+    if (Number.isFinite(left)) {
+      lines.push(`${C.grey}time left${C.reset}    ` + (left > 0
+        ? `${C.bold}${formatDuration(left)}${C.reset}${C.grey} of ${Math.round(CONFIG.SESSION_SECONDS / 60)} minutes${C.reset}`
+        : `${C.red}time up — run "session end"${C.reset}`));
+    }
   }
   const unclaimed = CONFIG.BOOST_ACTIONS.filter(b => !STATE.boosts[b.id]);
   if (unclaimed.length) {
@@ -903,6 +1003,15 @@ Commands.round = function () {
   if (!s) {
     if (JSON_MODE) return emit({ ok: false, error: "no-session" }, 1);
     fail("No session is running. Run `node cli.js session start` first.");
+  }
+  /* The session's 10 minutes are up. Refused rather than auto-ended: `round` is
+     a scriptable command and quietly archiving the run underneath a script that
+     asked for a round would be a surprising place to lose one. Exit 1 is the
+     "refused action" code, same as an already-claimed daily. */
+  if (Game.sessionExpired()) {
+    if (JSON_MODE) return emit({ ok: false, error: "session-time-up", sessionId: s.sessionId }, 1);
+    fail("Session time is up (" + Math.round(CONFIG.SESSION_SECONDS / 60) +
+      " minutes). Run `node cli.js session end` for your results.");
   }
   if (prediction && risk > STATE.balance) {
     if (JSON_MODE) return emit({ ok: false, error: "insufficient-balance", balance: STATE.balance }, 1);
@@ -1021,7 +1130,9 @@ function ensureVotes() {
       used.add(c[0]);
       coins.push({ ticker: c[0], emoji: c[1], votes: Rules.randInt(50, 900) });
     }
-    STATE.votes = { endsAt: Date.now() + 60 * 60 * 1000, coins, voted: false };
+    // Window length from CONFIG, not a literal — app.js held its own copy of this
+    // hour, so the same vote closed at different times in the two front ends.
+    STATE.votes = { endsAt: Date.now() + CONFIG.VOTE_WINDOW_MS, coins, voted: false };
     saveState();
   }
   return STATE.votes;
@@ -1202,11 +1313,16 @@ Commands.play = async function () {
     if (!started.ok) return fail("Could not start a session: " + started.error, 3);
   }
 
-  say(C.grey + "  " + CONFIG.ROUND_SECONDS + "s per round to call it. " +
+  say(C.grey + "  " + CONFIG.ROUND_SECONDS + "s per round to call it, " +
+      Math.round(CONFIG.SESSION_SECONDS / 60) + " minutes for the whole run. " +
       "Type " + C.reset + C.bold + "q" + C.reset + C.grey + " at any prompt to end the run." + C.reset);
+  if (Number.isFinite(Game.sessionMsLeft()) && Game.sessionMsLeft() < CONFIG.SESSION_SECONDS * 1000) {
+    say(C.grey + "  " + formatDuration(Game.sessionMsLeft()) + " left on this run's clock." + C.reset);
+  }
   blank();
 
   let playing = true;
+  let timeUp = false;
   while (playing) {
     const s = STATE.session;
     if (!s) break;
@@ -1214,15 +1330,28 @@ Commands.play = async function () {
       say(C.red + "  You're out of points — that's the run." + C.reset);
       break;
     }
+    /* The session clock outranks everything else in this loop: with less than
+       SESSION_MIN_ROUND_SECONDS left there is no round worth dealing, so the run
+       goes to its summary instead of opening one the clock would cut off. */
+    if (!Game.sessionRoundFits()) { timeUp = true; break; }
 
     const dealt = Game.dealRound();
     blank();
     renderCoin(dealt.coin, dealt.roundNum);
     say(C.grey + "  balance " + C.reset + C.bold + fmt(STATE.balance) + C.reset +
-        C.grey + "   ·   " + s.wins + "W/" + s.losses + "L   ·   streak " + s.currentStreak + C.reset);
+        C.grey + "   ·   " + s.wins + "W/" + s.losses + "L   ·   streak " + s.currentStreak +
+        (Number.isFinite(Game.sessionMsLeft())
+          ? "   ·   " + formatDuration(Game.sessionMsLeft()) + " left in session"
+          : "") + C.reset);
     blank();
 
-    const deadline = Date.now() + CONFIG.ROUND_SECONDS * 1000;
+    /* The decision window is the shorter of the round clock and whatever the
+       session has left, so the last round of a run ends with the run rather than
+       25 seconds after it. */
+    const deadline = Math.min(
+      Date.now() + CONFIG.ROUND_SECONDS * 1000,
+      s.endsAt || Infinity
+    );
 
     /* The decision loop. A typo, or a declined lock, sends you back to the
        direction prompt for the *same* coin rather than burning the round —
@@ -1313,10 +1442,20 @@ Commands.play = async function () {
       break;
     }
 
+    // Time's up: the round just resolved is the last one, so don't offer another.
+    if (!Game.sessionRoundFits()) { timeUp = true; break; }
+
     const again = await ask(`  ${C.grey}[enter] next round  ·  [q] end run${C.reset} ${PROMPT()}`);
     if (again.closed) break;
     const a = (again.answer || "").toLowerCase();
     if (a === "q" || a === "quit") playing = false;
+  }
+
+  if (timeUp && STATE.session) {
+    STATE.session.timeExpired = true;
+    blank();
+    say(C.yellow + C.bold + "  TIME! That's the " + Math.round(CONFIG.SESSION_SECONDS / 60) +
+        " minutes." + C.reset + C.grey + " Here's how the run went." + C.reset);
   }
 
   const ended = Game.endSession();

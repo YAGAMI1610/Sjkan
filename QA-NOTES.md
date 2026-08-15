@@ -194,11 +194,11 @@ lot. Nothing added is load-bearing — every animation degrades to a static
 state.
 
 ## Automated test suite
-`npm test` runs `npm run lint` plus four harnesses — **218 checks, 0 failures**.
+`npm test` runs `npm run lint` plus four harnesses — **255 checks, 0 failures**.
 Lint is `node --check` over `rules.js`, `app.js`, `api-client.js`, `audio.js`,
 `cli.js` and `server/server.js`.
 
-**`test/smoke-test.js`** (78 checks) boots the real `index.html` + `app.js` in
+**`test/smoke-test.js`** (106 checks) boots the real `index.html` + `app.js` in
 jsdom with `fetch` stubbed to reject, which is what forces the local
 simulation path the static build actually uses. `Math.random` is a seeded LCG,
 so a failure reproduces. It covers: boot with no unhandled errors; a
@@ -210,7 +210,8 @@ determinism; the paint-before-outcome ordering above; the full prediction flow;
 10,000 outcomes asserting `dir` never contradicts the sign of `pct`, and 60,000
 asserting the distribution is near-fair (P(UP) ≈ 49.2%); the balance math; a
 12-round session end-to-end; the ceremony and all four §44 exits; records;
-every other screen; and persistence across a reload.
+every other screen; and persistence across a reload. Groups 18 and 19 cover the
+ten-minute session clock and the campaign comparison panel (below).
 
 Three jsdom details worth knowing before editing this file. A top-level `const`
 in a browser lands in the global *lexical* scope, not on `window`, so it is
@@ -224,7 +225,7 @@ proxy-backed, so `localStorage.setItem = fn` stores an *item named "setItem"*
 rather than replacing the method; the whole object has to be swapped via
 `Object.defineProperty`, which is what `withStorage()` does.
 
-**`test/server-test.js`** (42 checks) boots `server/server.js` on an ephemeral
+**`test/server-test.js`** (43 checks) boots `server/server.js` on an ephemeral
 port and exercises every endpoint the client calls. This is the half of the
 build where the damaging bugs lived, precisely because they're unreachable from
 the static app: the client falls back to local simulation, so a broken server
@@ -235,12 +236,16 @@ and records with it), the DOWN-with-a-positive-percentage rows, the `dir:"FLAT"`
 row the client can never match, and `bestSessionNet: -Infinity`. Group 9 now
 guards the shared-rules architecture instead of text-diffing two copies of the
 same table: it fails the build if a second copy of `OUTCOMES`, `COIN_POOL`,
-`AWARD_DEFS` or `SIM_PLAYERS_BASE` reappears in `app.js` or `server/server.js`,
-if either file hard-codes `PAYOUT_MULTIPLIER`/`DAILY_POINTS`/
-`DYNAMIC_COIN_CHANCE`, or if `index.html` ever loads `rules.js` *after* `app.js`
-(which would leave `CadeRules` undefined at alias time). Two live HTTP checks
-then prove the running server pays exactly `Rules.scoreRound()` on a win and on
-a loss.
+`AWARD_DEFS`, `SIM_PLAYERS_BASE`, `PRIZE_TIERS` or `SIDE_QUESTS` reappears in
+`app.js` or `server/server.js`, if either file hard-codes `PAYOUT_MULTIPLIER`/
+`DAILY_POINTS`/`DYNAMIC_COIN_CHANCE`/`SESSION_SECONDS`/`VOTE_WINDOW_MS` (or the
+literal hour the vote window used to be), or if `index.html` ever loads
+`rules.js` *after* `app.js` (which would leave `CadeRules` undefined at alias
+time). Two live HTTP checks then prove the running server pays exactly
+`Rules.scoreRound()` on a win and on a loss, and a third proves the fields the
+server knows nothing about — the session deadline, the time-expired flag and the
+archived campaign comparison — survive `/api/session/end` and come back out of
+`/api/history` intact.
 
 Note when running the backend by hand: `express` is installed in
 `server/node_modules`, so the process has to be started from `server/`.
@@ -261,7 +266,7 @@ would take the slow failure path forever), that `server/`, `test/` and
 `node_modules/` are absent from the upload, and that no `gh*_`/`github_pat_`
 credential is embedded in any deployable file.
 
-**`test/cli-test.js`** (79 checks) is the production QA for the terminal build.
+**`test/cli-test.js`** (87 checks) is the production QA for the terminal build.
 It spawns the real `cli.js` as a child process rather than requiring it, because
 what breaks a CLI in production is not internal: it's argv parsing, exit codes,
 the save file, a stray colour escape in piped output. Each case gets a
@@ -288,6 +293,14 @@ The load-bearing groups:
   than read as `undefined`, and state survives the process boundary.
 - **Drift guard** — the same structural check as the server's group 9, applied to
   `cli.js`, plus an assertion that `cli.js` is in `.vercelignore`.
+- **Session clock and campaign comparison** — a new session is written with a
+  ten-minute absolute deadline; `status` reports `msLeft`/`timeUp` in JSON and
+  "time left … of 10 minutes" for a human; a `round` after the buzzer exits 1 with
+  `session-time-up` and moves neither the balance nor the round count, while
+  `session end` still works; the archived session carries a campaign comparison
+  whose rank, tier and prize agree with `PRIZE_TIERS`; and the printed box keeps
+  the SIMULATED label, the verbatim disclaimer and — the reason `wrapText()`
+  exists — every line inside the frame.
 
 ### CLI bugs found and fixed by this QA pass
 1. **`--seed banana` exited 1, not 2.** Seed validation ran above the `const C`
@@ -327,6 +340,196 @@ they are now regression-covered through `--script`, a documented mode in which
 requirement. The one thing still verified by hand rather than in the suite is the
 25-second clock actually expiring, since asserting it costs 25s of wall clock;
 that was confirmed under a pty, resolving `SKIPPED` with nothing staked.
+
+## Two more bugs fixed (stake escrow + arena art)
+
+### The stake was not held for the life of the round
+Reported as "the balance isn't deducted when I stake." The final numbers were in
+fact correct — a loss was debited at `app.js` resolve time and a win credited
+`risk × 1.8` — so 20,000 staking 10,000 ended on 38,000 or 10,000 either way.
+What was actually wrong is the window in between. The countdown keeps running
+after **LOCK IT IN** (`Round.startTimer`), and for those up-to-25 seconds the
+committed stake was still counted as spendable balance: the header showed it, and
+the next round's risk grid would have offered it.
+
+Where the deduction lives is worth stating, because it is the first thing anyone
+looking for this will get wrong. `rules.js` `scoreRound()` is **pure scoring** —
+it takes a prediction, a direction and a stake and returns a label plus a signed
+*net* delta (`+profit` on a win, `−risk` on a loss). It never sees a balance. Each
+front end applies that delta itself: `app.js` in `Round.resolve()`, `cli.js` in
+`Game.resolveRound()`, `server/server.js` in the round-submit handler. So stake
+timing is a **front-end** concern and there was nothing to change in the shared
+rules.
+
+The browser now escrows: `lockInPrediction()` debits the stake and records it on
+`Round.escrow`, and `settleEscrow()` returns it when the round is decided. Because
+the payout is a net delta, stake-back plus payout lands on exactly the balance the
+old resolve-time-only arithmetic produced — the economics are untouched, and
+`netResult === sum(payouts)` still holds, which is what keeps the CLI ledger check
+and the server contract green.
+
+Escrowing introduces three ways to lose a stake, all of them now closed:
+
+- **Session ended or restarted mid-round.** `endSession()` settles *before* it
+  snapshots `endingBalance`; reading the balance first would archive a phantom
+  loss and leave `netResult` short by the stake permanently. `RESTART` routes
+  through `endSession()`, so it is covered by the same line.
+- **The abandoned round resolving later.** Its timer still fires, so
+  `Round.resolve()` settles on the dropped-round path too. `settleEscrow()` is
+  idempotent — it zeroes `escrow` on the first call — so the overlapping settle
+  points cannot pay a stake back twice. The comment on that path used to say "the
+  balance was never debited"; that is no longer true and has been corrected.
+- **A reload between the lock and the resolve.** `Round` lives in memory and no
+  round is ever resumed, so the debit would outlive the round that owed it. The
+  stake is mirrored into `STATE.pendingStake` (persisted), and `loadState()`
+  refunds anything it finds there at boot, coercing through
+  `Math.max(0, Math.floor(...))` so a hand-edited or malformed save cannot mint
+  points.
+
+The CLI and the server were checked for the same defect and do not have it: in
+both, the stake is chosen and the round scored in one atomic step with no window
+in between (the server does not even hear about a round until it is already
+decided), so an escrow there would debit and credit inside the same function. They
+were deliberately left alone.
+
+Group 16 of the UI suite covers all of it: the debit landing at the lock rather
+than at resolve, the net-per-round movement being unchanged, the mid-round session
+end, the idempotent second settle, the orphan refund, and six malformed
+`pendingStake` values that must not move the balance.
+
+### Nothing rendered above the READY FOR MADNESS? card
+Reported as a broken image. Nothing was broken and nothing was 404ing: the Arena
+screen had **no image element at all**. `index.html` went straight from
+`<section id="screen-arena">` into `#arenaPreStart`, and the only hero art slot in
+the app was `#heroArtSlot` on the *home* screen. There was no path to check, which
+is why it presented as plain empty space.
+
+Added `#arenaArtSlot` above the pre-start card, filled from the same
+`AssetManager.paths.hero` asset the home hero uses — so it inherits the emoji
+fallback and picks up real art with no code change. It is shown and hidden
+alongside `#arenaPreStart` via `UI.showArenaArt()`, called at the two existing
+toggle sites, so the art does not hang around over live gameplay.
+
+Two robustness fixes went in alongside, because they are the failure mode the
+report described even though they were not the cause here. `hero-artwork.svg`
+carried a `viewBox` and no `width`/`height`; an `<img>` sized `height:auto` from a
+viewBox alone can resolve to **zero height**, which renders as blank space with no
+broken-image icon — indistinguishable from a missing file. The SVG now declares
+its intrinsic 600×400, and `.arena-art .art-slot img` pins `aspect-ratio: 3 / 2`
+so the box exists regardless. Group 17 asserts the slot exists, is filled, sits
+before the card in document order, hides during play, and that both the
+`aspect-ratio` rule and the SVG's intrinsic dimensions are still there.
+
+## Two features added (ten-minute runs + the campaign comparison)
+
+### A run is now capped at ten minutes
+The brief was "a full session/round of play lasts 10 minutes total, so results and
+awards can be shown and shared quickly." Worth stating how that was read, because
+the app has two clocks and only one of them should be ten minutes:
+`CONFIG.ROUND_SECONDS` (25) is the window to call **one** coin, and there was no
+session-length cap anywhere. Making a *round* ten minutes would have contradicted
+the 25-second prediction window in the spec and reduced a whole run to a single
+call. So a second, longer clock was added — `CONFIG.SESSION_SECONDS = 600` — and
+the per-round window is untouched. If the intent was the other reading, the
+one-line change is `ROUND_SECONDS`, and the drift guards will keep every front end
+in step either way.
+
+Design points that matter more than the number:
+
+- **The deadline is an absolute timestamp on the session** (`session.endsAt`), not
+  a counted-down variable. A backgrounded tab has its `setInterval` throttled to
+  roughly once a minute, so a decrementing counter comes back minutes wrong. This
+  way the clock is recomputed from `Date.now()` and is always right. The CLI stores
+  the same field, so a run resumed in a later invocation is still bound by the
+  clock it started under — which is also why the CLI can be tested without waiting
+  ten real minutes: the suite rewrites `endsAt` in the save file.
+- **The last round shortens to fit.** `SessionClock.roundSeconds()` is
+  `min(ROUND_SECONDS, whole seconds left)`, so "ten minutes" is true to the second
+  rather than to the nearest 25. Below `SESSION_MIN_ROUND_SECONDS` (5) no further
+  coin is dealt — a two-second round is worse than no round.
+- **A locked prediction at the buzzer is still resolved.** The stake is already
+  out of the balance and the outcome was rolled before time ran out; cancelling it
+  would be taking a paid-for call off the player. Its result card is the last thing
+  shown, and because the clock has expired the card's button reads SEE FINAL
+  RESULT and routes to the summary.
+- **`Round.advance()` is now the only way into the next round.** The NEXT MEME
+  button and the auto-advance after a skipped round both funnel through it, so the
+  clock is checked in exactly one place. Without that, a ten-minute session runs
+  forever as long as somebody keeps tapping.
+- **A run left open by a closed tab is archived on the next load.**
+  `Game.closeExpiredSession()` runs from `init()` — not from `loadState()`, which
+  executes at module scope before `Game` and `SessionClock` exist (a `const` is not
+  hoisted; this project has been bitten by that twice). The rounds are kept, the
+  session lands in History, no ceremony fires.
+- **The community vote window moved into `CONFIG`.** It was a literal
+  `60*60*1000` in `app.js` *and* in `cli.js` — two copies of one duration, which is
+  how they drift. It is now `CONFIG.VOTE_WINDOW_MS`, ten minutes to match a run,
+  and both drift guards fail the build if that literal comes back.
+
+`server/server.js` needed no change and got none. It has no duration logic at all
+(its only vote rule is one vote per round), and `/api/session/end` does
+`Object.assign({}, activeSession, session, …)`, so `endsAt`, `timeExpired` and the
+campaign block ride along with the client's session object — now asserted, so a
+future refactor that starts filtering unknown fields fails the suite. Rejecting a
+post-deadline round server-side was considered and rejected: the client has already
+applied the balance locally, so a server-only refusal would desync the two.
+
+### "If this were the real campaign"
+At the end of a run the summary now ranks the player's net credits against a
+simulated field and reports which of the real campaign's daily prize tiers that
+rank would sit in — $2,000 / $1,200 / $800 / $600 / $500, $300 for 6th–10th, $120
+for 11th–20th, $50 for 21st–40th, $20 for 41st–100th, nothing outside the top 100
+— plus the two $400 Side Quests when the run qualifies: The Grinder (volume,
+right or wrong) and The Smasher (biggest single payout multiple). It sits where the
+end-of-session summary already was, in the browser (`UI.renderCampaignSim`) and in
+the CLI (`renderCampaignSim` under `session end`).
+
+All of it lives in `rules.js` — `PRIZE_TIERS`, `SIDE_QUESTS`, `CAMPAIGN_DISCLAIMER`
+and the four pure functions (`prizeForRank`, `simulateRivalScores`,
+`bestWinningRound`, `simulateCampaignResult`, plus `campaignResultLines` for the
+wording) — so the terminal and the browser say the same thing rather than two
+paraphrases, and the drift guards cover the new tables too.
+
+Three decisions worth recording:
+
+- **The field is scored by the real `scoreRound()`.** Each invented rival gets a
+  stake habit from `QUICK_RISKS`, a round count bounded by what fits in ten
+  minutes, and a hit rate in 32–68%; every one of their rounds then goes through
+  the same function the player's rounds go through. A hand-tuned score range would
+  have looked fine today and become unwinnable the moment `PAYOUT_MULTIPLIER` or
+  `RISK_TIERS` moved.
+- **The field is 150 entrants, not 100 — a deliberate deviation from the brief's
+  "~99 other realistic scores."** With 99 rivals and a table that pays down to
+  100th, *every* entrant places: a run finishing 8,000 points down still ranked
+  94th and "won" $20, and the requested "you wouldn't have placed in the top 100"
+  message was unreachable dead code. A real campaign day has a field the top 100 is
+  cut *from*, so the paying cut (`PRIZE_FIELD_SIZE = 100`) and the simulated field
+  (`CAMPAIGN_ENTRANTS = 150`) are now separate numbers. Verified over 60 runs per
+  level: net −20,000 ranks ~145th and never places; 0 ranks ~117th; +4,000 ranks
+  ~68th and always takes the $20 tier; +25,000 ~30th; +150,000 top five. Both
+  messages are now reachable, and a UI check fails the build if the two constants
+  are ever set so that nobody can miss.
+- **Rolled once, at archive time.** `simulateCampaignResult()` is called in
+  `archiveSession()`/`endSession()` and the result is stored on the session.
+  Rolling it in the renderer would hand the player a different rank and a different
+  prize every time they reopened the same run from History. Sessions archived
+  before this existed get one rolled on first view and then persisted, not
+  re-rolled.
+
+**On the disclaimer.** A dollar figure on a results screen reads as a promise
+unless it is fenced, and this prototype has no connection to cade.market. So the
+panel says so twice — a SIMULATED badge on the heading and the full
+`CAMPAIGN_DISCLAIMER` printed verbatim underneath, styled with real contrast
+rather than as fine print — and the suites assert it: the browser check fails if
+the panel shows a figure without the badge and the verbatim sentence beside it, and
+the CLI check compares the printed text against `Rules.CAMPAIGN_DISCLAIMER` on
+collapsed whitespace so a wrapped line still has to match. Nothing here is a real,
+offered, payable or guaranteed prize, and no rival in the field is a real entrant.
+
+One thing the CLI needed for this: `box()` pads every row to `BOX_W - 4` and never
+truncates, so a full sentence pushed the right border off the frame. `wrapText()`
+greedily wraps prose at `BOX_W - 6` and icon-prefixed quest lines at `BOX_W - 10`,
+and a suite check now walks the box line by line asserting nothing escapes it.
 
 ## The rules live in one file now
 The three front ends — browser, CLI, backend — used to each hold their own copy

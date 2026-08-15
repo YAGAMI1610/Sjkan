@@ -34,6 +34,23 @@
     DAILY_POINTS: 20000,
     DAILY_CLAIM_WINDOW_MS: 24 * 3600 * 1000,
     ROUND_SECONDS: 25,
+    /* How long a whole run lasts, wall-clock, before it goes to its results and
+       awards. Deliberately NOT the same knob as ROUND_SECONDS: that is the
+       per-round decision window (§ the 25s countdown in the arena), this is the
+       ceiling on the session that contains those rounds — about 24 of them.
+       Making a *round* ten minutes long would instead reduce a session to a
+       single prediction. */
+    SESSION_SECONDS: 600,
+    /* Don't open a round the session clock cannot finish. With less than this
+       left the run goes straight to its results rather than dealing a coin
+       nobody has time to call. */
+    SESSION_MIN_ROUND_SECONDS: 5,
+    /* How long a Meme Madness vote stays open. Matched to the session length so
+       a vote cast at the start of a run can still be seen closing in the same
+       sitting. This was a hard-coded hour written out twice — once in app.js and
+       once in cli.js — which is exactly the kind of duplicated tunable this file
+       exists to hold. */
+    VOTE_WINDOW_MS: 10 * 60 * 1000,
     PAYOUT_MULTIPLIER: 1.8, // default flat multiplier
     RISK_TIERS: [
       { min: 0, max: 500, mult: 1.5 },
@@ -125,11 +142,87 @@
   };
 
   /* ---------------------------------------------------------
-     PURE HELPERS
+     SIMULATED REAL-CAMPAIGN COMPARISON
+     -----------------------------------------------------
+     At the end of a run we tell the player where a score like theirs would have
+     landed in the real cade.market Meme Madness campaign's daily prize table.
+
+     Read this before touching anything below: it is an ILLUSTRATION, not a
+     result. This prototype is not connected to cade.market in any way, there is
+     no live competitor data to rank anybody against, and the "field" the player
+     is placed in is CAMPAIGN_ENTRANTS − 1 rivals invented by
+     simulateRivalScores() a moment earlier. Every front end that shows a number
+     from here is required to show CAMPAIGN_DISCLAIMER with it — the tests assert
+     that, because a prize figure without that sentence next to it reads as a
+     promise.
      --------------------------------------------------------- */
+
+  // The real campaign's published Tournament Day table, in USDC. Ranks past the
+  // last row win nothing, which is why there is no catch-all tier.
+  var PRIZE_TIERS = [
+    { min: 1, max: 1, usd: 2000, label: "1st" },
+    { min: 2, max: 2, usd: 1200, label: "2nd" },
+    { min: 3, max: 3, usd: 800, label: "3rd" },
+    { min: 4, max: 4, usd: 600, label: "4th" },
+    { min: 5, max: 5, usd: 500, label: "5th" },
+    { min: 6, max: 10, usd: 300, label: "6th–10th" },
+    { min: 11, max: 20, usd: 120, label: "11th–20th" },
+    { min: 21, max: 40, usd: 50, label: "21st–40th" },
+    { min: 41, max: 100, usd: 20, label: "41st–100th" }
+  ];
+
+  // Ranks past the last row above win nothing, so 100 is the paying cut.
+  var PRIZE_FIELD_SIZE = 100;
+
+  /* How many entrants the simulated day has, the player included.
+     Deliberately more than PRIZE_FIELD_SIZE. A field of exactly 100 sounds
+     right — one rival per paying rank — but the table pays down to 100th, so
+     every single entrant would place and "you wouldn't have placed in the top
+     100" could never be shown. A real campaign day has a field the top 100 is
+     cut *from*. At 150, a losing session misses out, a break-even one scrapes
+     the bottom tier, and 1st still means beating all 149. */
+  var CAMPAIGN_ENTRANTS = 150;
+
+  /* The two daily Side Quests. Each is a separate pot from the leaderboard
+     prizes, so a player can be told about one without having placed.
+     The thresholds are what makes a player "in the running": we cannot know
+     whether they'd have topped the real day's field, and the wording never
+     claims they would have. */
+  var SIDE_QUESTS = {
+    GRINDER_QUEST: {
+      id: "GRINDER_QUEST", icon: "🔥", title: "THE GRINDER QUEST", usd: 400,
+      desc: "Most predictions in a day, right or wrong.",
+      // A 10-minute session fits ~24 rounds at ROUND_SECONDS each; half of that
+      // is a genuinely heavy day of calling rather than a participation badge.
+      minPredictions: 12
+    },
+    SMASHER_QUEST: {
+      id: "SMASHER_QUEST", icon: "💥", title: "THE SMASHER QUEST", usd: 400,
+      desc: "Highest payout multiple from a single correct prediction in a day.",
+      // Above the BIGGEST_PAYOUT award's 3,000 — this is the top of the day, not
+      // just a good round.
+      minPayout: 5000
+    }
+  };
+
+  var CAMPAIGN_NAME = "CADE Meme Madness";
+
+  var CAMPAIGN_DISCLAIMER = "Simulated comparison, shown for illustration only. " +
+    "This is a prototype and is not affiliated with, endorsed by or connected to " +
+    "cade.market. Every other player in the field is generated, not a real " +
+    "entrant, and no prize here is real, offered, payable or guaranteed.";
+
+
   function rand(min, max) { return Math.random() * (max - min) + min; }
   function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
   function pick(arr) { return arr[randInt(0, arr.length - 1)]; }
+
+  /* Thousands separators, for the few strings this file builds itself (the Side
+     Quest details). Hand-rolled rather than toLocaleString so a number reads the
+     same in a browser, a terminal and a server with no ICU data. */
+  function fmtPoints(n) {
+    return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
 
   /** Single source of truth for direction. Any outcome whose rolled percentage
    *  is >= 0 is an UP move, anything below is DOWN — so the direction a player
@@ -242,6 +335,187 @@
     return out;
   }
 
+  /* ---------------------------------------------------------
+     SIMULATED REAL-CAMPAIGN COMPARISON — pure functions
+     --------------------------------------------------------- */
+
+  /** The prize row a finishing rank falls in, or null for "no prize". */
+  function prizeForRank(rank) {
+    var r = Math.floor(Number(rank) || 0);
+    if (r < 1) return null;
+    for (var i = 0; i < PRIZE_TIERS.length; i++) {
+      if (r >= PRIZE_TIERS[i].min && r <= PRIZE_TIERS[i].max) return PRIZE_TIERS[i];
+    }
+    return null;
+  }
+
+  /** Invent a day's worth of rival results.
+   *
+   *  Each rival gets a stake habit, a round count and a hit rate, and then every
+   *  one of their rounds is put through scoreRound() — the same function the
+   *  player's own rounds go through. That is the point: the field ends up on the
+   *  same scale as a real run because it is produced by the same payout rule,
+   *  not by a hand-tuned range that would drift the moment PAYOUT_MULTIPLIER or
+   *  RISK_TIERS changed. */
+  function simulateRivalScores(count) {
+    var n = Math.max(0, Math.floor(Number(count) || 0));
+    var maxRounds = Math.max(3, Math.floor(CONFIG.SESSION_SECONDS / CONFIG.ROUND_SECONDS));
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      var habit = pick(CONFIG.QUICK_RISKS);
+      var rounds = randInt(3, maxRounds);
+      var hitRate = rand(0.32, 0.68); // the spread between a lucky day and a bad one
+      var net = 0, best = 0, bestMultiple = 0, predictions = 0;
+      for (var r = 0; r < rounds; r++) {
+        var wager = Math.max(1, Math.round(habit * rand(0.5, 1.5)));
+        var won = Math.random() < hitRate;
+        var scored = scoreRound("UP", won ? "UP" : "DOWN", wager);
+        net += scored.payout;
+        predictions++;
+        if (scored.payout > best) {
+          best = scored.payout;
+          bestMultiple = scored.multiplier;
+        }
+      }
+      out.push({ net: net, predictions: predictions, bestPayout: best, bestMultiple: bestMultiple });
+    }
+    return out;
+  }
+
+  /** Best single winning round in a session, as an absolute payout and as a
+   *  multiple of what was staked to get it. Tolerates sessions archived before
+   *  per-round records existed, and rounds trimmed for storage. */
+  function bestWinningRound(session) {
+    var rounds = (session && Array.isArray(session.rounds)) ? session.rounds : [];
+    var bestPayout = 0, bestMultiple = 0;
+    for (var i = 0; i < rounds.length; i++) {
+      var r = rounds[i] || {};
+      var payout = Number(r.payout) || 0;
+      if (r.result !== "WIN" || payout <= 0) continue;
+      var risk = Number(r.riskAmount) || 0;
+      if (payout > bestPayout) {
+        bestPayout = payout;
+        bestMultiple = risk > 0 ? +(payout / risk).toFixed(2) : 0;
+      }
+    }
+    // A session summary carries largestPayout even when its rounds have been
+    // dropped, so fall back to it rather than reporting a best of zero.
+    if (!bestPayout && Number(session && session.largestPayout) > 0) {
+      bestPayout = Math.floor(Number(session.largestPayout));
+      bestMultiple = getMultiplier(bestPayout);
+    }
+    return { bestPayout: bestPayout, bestMultiple: bestMultiple };
+  }
+
+  /** Where a finished session's net would have landed in the real campaign's
+   *  daily table, against a simulated field. Pure — pass `opts.rivals` to score
+   *  against a fixed field instead of a freshly rolled one, which is what the
+   *  tests do.
+   *
+   *  Ranking is on net credits for the session, the same number the share card
+   *  calls NET. Ties go to the player (rank = 1 + rivals strictly ahead), which
+   *  is the only tie rule that cannot hand someone a worse rank than a rival
+   *  they matched. */
+  function simulateCampaignResult(session, opts) {
+    var o = opts || {};
+    var fieldSize = Math.max(1, Math.floor(Number(o.fieldSize) || CAMPAIGN_ENTRANTS));
+    var rivals = Array.isArray(o.rivals) ? o.rivals : simulateRivalScores(fieldSize - 1);
+
+    var score = Math.round(Number(session && session.netResult) || 0);
+    var wins = Math.max(0, Math.floor(Number(session && session.wins) || 0));
+    var losses = Math.max(0, Math.floor(Number(session && session.losses) || 0));
+    // Predictions, not rounds: a round the clock ran out on was never a call.
+    var predictions = wins + losses;
+    var best = bestWinningRound(session);
+
+    var ahead = 0, rivalPredictions = 0, rivalBestPayout = 0;
+    for (var i = 0; i < rivals.length; i++) {
+      var rv = rivals[i] || {};
+      if ((Number(rv.net) || 0) > score) ahead++;
+      if ((Number(rv.predictions) || 0) > rivalPredictions) rivalPredictions = Number(rv.predictions) || 0;
+      if ((Number(rv.bestPayout) || 0) > rivalBestPayout) rivalBestPayout = Number(rv.bestPayout) || 0;
+    }
+    var rank = ahead + 1;
+    var prize = prizeForRank(rank);
+
+    var quests = [];
+    if (predictions >= SIDE_QUESTS.GRINDER_QUEST.minPredictions) {
+      quests.push({
+        id: SIDE_QUESTS.GRINDER_QUEST.id,
+        icon: SIDE_QUESTS.GRINDER_QUEST.icon,
+        title: SIDE_QUESTS.GRINDER_QUEST.title,
+        usd: SIDE_QUESTS.GRINDER_QUEST.usd,
+        // "in the running" is the strongest honest claim: the real day's top
+        // grinder is unknowable, so leading the simulated field is the most that
+        // can be said, and even that is only about the invented rivals.
+        leadsField: predictions >= rivalPredictions,
+        detail: predictions + " predictions this session"
+      });
+    }
+    if (best.bestPayout >= SIDE_QUESTS.SMASHER_QUEST.minPayout) {
+      quests.push({
+        id: SIDE_QUESTS.SMASHER_QUEST.id,
+        icon: SIDE_QUESTS.SMASHER_QUEST.icon,
+        title: SIDE_QUESTS.SMASHER_QUEST.title,
+        usd: SIDE_QUESTS.SMASHER_QUEST.usd,
+        leadsField: best.bestPayout >= rivalBestPayout,
+        detail: best.bestMultiple
+          ? best.bestMultiple + "x on one call (+" + fmtPoints(best.bestPayout) + ")"
+          : "+" + fmtPoints(best.bestPayout) + " on one call"
+      });
+    }
+
+    return {
+      campaign: CAMPAIGN_NAME,
+      score: score,
+      rank: rank,
+      fieldSize: fieldSize,
+      paidRanks: PRIZE_FIELD_SIZE,
+      placed: !!prize,
+      prizeUsd: prize ? prize.usd : 0,
+      tierLabel: prize ? prize.label : null,
+      predictions: predictions,
+      bestPayout: best.bestPayout,
+      bestMultiple: best.bestMultiple,
+      quests: quests,
+      simulated: true,
+      disclaimer: CAMPAIGN_DISCLAIMER
+    };
+  }
+
+  /* The quest names are stored in the arcade all-caps the UI uses everywhere
+     else; mid-sentence they need to read as names. */
+  function titleCaseQuest(title) {
+    return String(title || "").toLowerCase().replace(/(^|\s)([a-z])/g, function (m, sp, ch) {
+      return sp + ch.toUpperCase();
+    });
+  }
+
+  /** The comparison as plain sentences, so the browser summary, the CLI summary
+   *  and any share text all say the same thing rather than three paraphrases.
+   *  Returns { headline: string, quests: [string], disclaimer: string }. */
+  function campaignResultLines(result) {
+    var r = result || {};
+    var rank = Math.max(1, Math.floor(Number(r.rank) || 0));
+    var opener = "If you performed like this in the real " + (r.campaign || CAMPAIGN_NAME) +
+      " campaign, you would have ranked around number " + rank;
+    var headline = r.placed
+      ? opener + " and won $" + fmtPoints(r.prizeUsd) + "!"
+      : opener + " — you wouldn't have placed in the top " +
+        (Number(r.paidRanks) || PRIZE_FIELD_SIZE) + ".";
+
+    var quests = (Array.isArray(r.quests) ? r.quests : []).map(function (q) {
+      if (q.id === SIDE_QUESTS.SMASHER_QUEST.id) {
+        return "Your best single-round multiplier could win you " +
+          titleCaseQuest(q.title) + ", $" + q.usd + "!";
+      }
+      return "You'd be in the running for " + titleCaseQuest(q.title) +
+        ", $" + q.usd + ", for most predictions today!";
+    });
+
+    return { headline: headline, quests: quests, disclaimer: r.disclaimer || CAMPAIGN_DISCLAIMER };
+  }
+
   return {
     CONFIG: CONFIG,
     COIN_POOL: COIN_POOL,
@@ -251,6 +525,12 @@
     SIM_PLAYERS_BASE: SIM_PLAYERS_BASE,
     OUTCOMES: OUTCOMES,
     AWARD_DEFS: AWARD_DEFS,
+    PRIZE_TIERS: PRIZE_TIERS,
+    PRIZE_FIELD_SIZE: PRIZE_FIELD_SIZE,
+    CAMPAIGN_ENTRANTS: CAMPAIGN_ENTRANTS,
+    SIDE_QUESTS: SIDE_QUESTS,
+    CAMPAIGN_NAME: CAMPAIGN_NAME,
+    CAMPAIGN_DISCLAIMER: CAMPAIGN_DISCLAIMER,
     rand: rand,
     randInt: randInt,
     pick: pick,
@@ -263,6 +543,11 @@
     generateOutcome: generateOutcome,
     scoreRound: scoreRound,
     calculateAwards: calculateAwards,
-    awardsOf: awardsOf
+    awardsOf: awardsOf,
+    prizeForRank: prizeForRank,
+    simulateRivalScores: simulateRivalScores,
+    bestWinningRound: bestWinningRound,
+    simulateCampaignResult: simulateCampaignResult,
+    campaignResultLines: campaignResultLines
   };
 }));
