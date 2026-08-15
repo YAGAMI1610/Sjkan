@@ -7,6 +7,7 @@ const STORAGE_KEY = "cade_meme_madness_v1";
 
 const CONFIG = {
   DAILY_POINTS: 20000,
+  DAILY_CLAIM_WINDOW_MS: 24 * 3600 * 1000,
   ROUND_SECONDS: 25,
   PAYOUT_MULTIPLIER: 1.8, // default flat multiplier
   RISK_TIERS: [
@@ -15,6 +16,9 @@ const CONFIG = {
     { min: 2501, max: 10000000, mult: 2.0 }
   ],
   USE_TIERED_PAYOUT: false, // toggle to true to use RISK_TIERS instead of flat multiplier
+  // §8 — share of rounds that mint a brand-new ticker instead of drawing from
+  // the curated COIN_POOL. 0 = curated only, 1 = always freshly generated.
+  DYNAMIC_COIN_CHANCE: 0.45,
   QUICK_RISKS: [100, 250, 500, 1000, 2500, 5000, 10000],
   BOOST_ACTIONS: [
     { id: "profile", label: "CREATE YOUR CADE PROFILE", reward: 500, icon: "🪪" },
@@ -42,7 +46,10 @@ const AssetManager = {
     hero: "assets/hero-artwork.svg",
     coin: ticker => `assets/coins/${ticker.toLowerCase()}.svg`,
     award: code => `assets/awards/${code.toLowerCase()}.svg`,
-    avatar: id => `assets/avatars/${String(id).toLowerCase().replace(/\s+/g,'-')}.svg`
+    avatar: id => `assets/avatars/${String(id).toLowerCase().replace(/\s+/g,'-')}.svg`,
+    // §2/§40 — per-round meme artwork. Drop a file here to override the
+    // procedurally drawn comic panel MemeImage generates as its placeholder.
+    meme: ticker => `assets/memes/${ticker.toLowerCase()}.svg`
   },
 
   // Returns a DOM string for an art slot: tries the real asset,
@@ -53,6 +60,15 @@ const AssetManager = {
     // then swap to real asset if/when confirmed available.
     setTimeout(()=> this._tryLoad(id, path, fallbackEmoji), 0);
     return `<span class="art-slot ${className||''}" id="${id}" data-fallback="${fallbackEmoji}">${fallbackEmoji}</span>`;
+  },
+
+  // As slot(), but the placeholder is an arbitrary HTML/SVG string rather than a
+  // short emoji — so it is never round-tripped through a data- attribute (which
+  // would break on the quotes inside markup).
+  slotHTML(key, path, fallbackHTML, className){
+    const id = "art_" + key + "_" + Math.random().toString(36).slice(2,8);
+    setTimeout(()=> this._tryLoad(id, path, null), 0);
+    return `<span class="art-slot ${className||''}" id="${id}">${fallbackHTML}</span>`;
   },
 
   _tryLoad(id, path, fallbackEmoji){
@@ -74,6 +90,68 @@ const AssetManager = {
   }
 };
 
+/* =========================================================
+   MEME IMAGE (§2, §40)
+   Per-round meme artwork. A real file at assets/memes/<ticker>.svg always
+   wins; until one exists, a comic panel is drawn procedurally from the
+   coin's own identity so every coin — including the dynamically minted
+   ones that will never have a file — still gets distinct art rather than a
+   bare emoji. Palette is CADE flat colours, thick black outline, halftone
+   dots: no gradients, neon or hologram effects.
+   ========================================================= */
+const MemeImage = {
+  // Stable per-ticker hash so a coin looks identical every time it appears.
+  _hash(str){
+    let h = 0;
+    for(let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) & 0x7fffffff;
+    return h;
+  },
+  ACCENTS: ["#7B3FE4","#FFD23F","#FF7A29","#3FCF6E","#FF4F4F","#00B4D8","#FF6FB5"],
+
+  panel(coin){
+    const h = this._hash(coin.ticker);
+    const accent = this.ACCENTS[h % this.ACCENTS.length];
+    const rays = 12 + (h % 6);
+    const rot = h % 30;
+    // Comic sunburst + halftone + the coin's emoji as the "character".
+    const raySlices = Array.from({length: rays}, (_,i)=>{
+      const a1 = (360/rays)*i, a2 = a1 + (360/rays)/2;
+      const p = (deg,r)=>[100+r*Math.cos(deg*Math.PI/180), 70+r*Math.sin(deg*Math.PI/180)];
+      const [x1,y1] = p(a1,150), [x2,y2] = p(a2,150);
+      return `<path d="M100,70 L${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)} Z" fill="${accent}" opacity=".55"/>`;
+    }).join("");
+    return `<svg viewBox="0 0 200 140" role="img" aria-label="${coin.ticker} meme artwork" preserveAspectRatio="xMidYMid slice">
+      <defs>
+        <clipPath id="mp_${h}"><rect x="0" y="0" width="200" height="140" rx="8"/></clipPath>
+        <pattern id="ht_${h}" width="7" height="7" patternUnits="userSpaceOnUse">
+          <circle cx="1.6" cy="1.6" r="1.5" fill="#111" opacity=".22"/>
+        </pattern>
+      </defs>
+      <g clip-path="url(#mp_${h})">
+        <rect width="200" height="140" fill="#FFF8EC"/>
+        <g transform="rotate(${rot} 100 70)">${raySlices}</g>
+        <rect width="200" height="140" fill="url(#ht_${h})"/>
+        <text x="100" y="92" font-size="62" text-anchor="middle">${coin.emoji}</text>
+        <rect x="0" y="112" width="200" height="28" fill="#111"/>
+        <text x="100" y="132" font-size="17" font-weight="900" text-anchor="middle"
+              fill="#FFF8EC" font-family="Arial Black, Arial, sans-serif"
+              letter-spacing="0.5">$${coin.ticker}</text>
+      </g>
+      <rect x="2" y="2" width="196" height="136" rx="8" fill="none" stroke="#111" stroke-width="4"/>
+    </svg>`;
+  },
+
+  // The replaceable slot the UI actually calls.
+  render(coin){
+    return AssetManager.slotHTML(
+      "meme_" + coin.ticker,
+      AssetManager.paths.meme(coin.ticker),
+      this.panel(coin),
+      "meme-art-slot"
+    );
+  }
+};
+
 const COIN_POOL = [
   ["MOONFROG","🐸"],["BONKCAT","🐱"],["GIGAAPE","🦍"],["FROGGO","🐸"],
   ["MEMEDOG","🐶"],["CHADINU","🐕"],["ROCKETPANDA","🐼"],["WAGMIFROG","🐸"],
@@ -81,6 +159,20 @@ const COIN_POOL = [
   ["LASERSHARK","🦈"],["TURBOSNAIL","🐌"],["DIAMONDHAMSTER","🐹"],["SADCLOWN","🤡"],
   ["GIGACHAD","💪"],["MOONPIG","🐷"],["CRYOWL","🦉"],["SPICYTACO","🌮"]
 ];
+
+// The curated pool above holds the hand-designed coins — each one has real SVG
+// art on disk in /assets/coins. Spec §8 also calls for "many more dynamically",
+// so a share of rounds mint a brand-new ticker from the parts below. Generated
+// coins have no SVG file, so AssetManager falls them back to their emoji, which
+// is the intended behaviour rather than a missing asset.
+const COIN_PREFIXES = ["MOON","GIGA","TURBO","LASER","DIAMOND","CHAD","DEGEN","BASED",
+  "HYPER","MEGA","ULTRA","COSMIC","SPICY","THICC","ZOOM","QUANTUM","ANGRY","SLEEPY",
+  "ROCKET","GALAXY","JUMBO","MICRO","NEON","VELVET"];
+const COIN_SUFFIXES = ["FROG","DOG","CAT","APE","PANDA","SHARK","SNAIL","HAMSTER",
+  "CLOWN","PIG","OWL","BIRD","TACO","BONK","INU","WHALE","GOBLIN","WIZARD","NINJA",
+  "SLOTH","LLAMA","GECKO","MOOSE","TOAD"];
+const COIN_EMOJI = ["🐸","🐶","🐱","🦍","🐼","🦈","🐌","🐹","🤡","🐷","🦉","🐦","🌮",
+  "💪","🚀","🐳","👺","🧙","🥷","🦥","🦙","🦎","🫎","🐊"];
 
 const SIM_PLAYERS_BASE = [
   { name: "PEPE PROPHET", avatar: "🐸" },
@@ -123,6 +215,10 @@ const AWARD_DEFS = {
 /* ---------------- STATE ---------------- */
 function defaultState(){
   return {
+    // §41 — stable local identity for the session records. Not an account: it
+    // just lets a session say who played it, and gives the backend something to
+    // reconcile against when real auth replaces device-linked accounts.
+    userId: "user_" + Math.random().toString(36).slice(2,10),
     balance: 0,
     lastClaim: null,
     boosts: { profile:false, share:false, submit:false, vote:false },
@@ -148,7 +244,15 @@ let STATE = loadState();
 function loadState(){
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
-    if(raw) return Object.assign(defaultState(), JSON.parse(raw));
+    if(raw){
+      const merged = Object.assign(defaultState(), JSON.parse(raw));
+      // Persist the userId the first time an older save is upgraded, so it stays
+      // stable across reloads instead of being regenerated from defaultState().
+      if(!JSON.parse(raw).userId){
+        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(merged)); }catch(e){}
+      }
+      return merged;
+    }
   }catch(e){}
   return defaultState();
 }
@@ -214,7 +318,7 @@ const Game = {
       // `STATE.balance = STATE.balance` (a no-op), leaving the player with a
       // "+20,000 POINTS CLAIMED!" toast and no points.
       const res = await Api.claimDaily(async ()=>{
-        if(STATE.lastClaim && now - STATE.lastClaim < 24*3600*1000){
+        if(STATE.lastClaim && now - STATE.lastClaim < CONFIG.DAILY_CLAIM_WINDOW_MS){
           const err = new Error("Already claimed"); err.status = 429; throw err;
         }
         STATE.balance += CONFIG.DAILY_POINTS;
@@ -260,6 +364,7 @@ const Game = {
   startSession(){
     const session = {
       sessionId: uid("sess"),
+      userId: STATE.userId,
       startedAt: Date.now(),
       endedAt: null,
       startingBalance: STATE.balance,
@@ -437,7 +542,6 @@ const Round = {
 
   async begin(){
     const s = STATE.session;
-    s.rounds.length; // no-op
     this.roundNum = s.rounds.length + 1;
     this.active = true;
     this.locked = false;
@@ -445,6 +549,20 @@ const Round = {
     this.risk = 0;
     this.timeLeft = CONFIG.ROUND_SECONDS;
     this.coin = MarketEngine.generateCoin();
+
+    // Paint the new round immediately. This used to happen *after* awaiting the
+    // outcome, so on any backend that isn't instant the arena kept showing the
+    // previous round's coin, price and chart for the whole round-trip — with the
+    // round number still on the old value. None of this markup depends on the
+    // outcome, so there's no reason to hold it back.
+    $("#roundTag").textContent = "ROUND " + String(this.roundNum).padStart(2,"0");
+    UI.renderCoin(this.coin);
+    UI.renderChart(this.coin);
+    UI.renderRiskGrid();
+    UI.resetPredictionUI();
+    UI.updateStatsStrip();
+    UI.updateTimerDisplay(this.timeLeft);
+
     // #9 — outcome is requested from (and, when a backend is present,
     // generated + held by) the server, so nothing in client state ever
     // reveals the result before the round timer expires. Falls back to
@@ -452,12 +570,10 @@ const Round = {
     this.outcome = await Api.getRoundOutcome(()=> MarketEngine.generateOutcome());
     if(!s.coinsEncountered.includes(this.coin.ticker)) s.coinsEncountered.push(this.coin.ticker);
 
-    $("#roundTag").textContent = "ROUND " + String(this.roundNum).padStart(2,"0");
-    UI.renderCoin(this.coin);
-    UI.renderChart(this.coin);
-    UI.renderRiskGrid();
-    UI.resetPredictionUI();
-    UI.updateStatsStrip();
+    // The countdown only starts once the outcome is in hand, so no player ever
+    // loses seconds off their 25 to network latency. Picking a direction and a
+    // stake already worked during the wait — only resolution needs the outcome,
+    // and resolution is driven exclusively by this timer.
     this.startTimer();
   },
 
@@ -547,11 +663,21 @@ const Round = {
    MARKET ENGINE
    ========================================================= */
 const MarketEngine = {
+  // §8 — most rounds draw a curated coin (those have hand-drawn SVG art), the
+  // rest mint an entirely new ticker so the pool never feels like a fixed list
+  // of 20. `isGenerated` lets the UI badge freshly minted coins as NEW.
   generateCoin(){
-    const [name, emoji] = pick(COIN_POOL);
+    let ticker, emoji, isGenerated = false;
+    if(Math.random() < CONFIG.DYNAMIC_COIN_CHANCE){
+      ticker = pick(COIN_PREFIXES) + pick(COIN_SUFFIXES);
+      emoji = pick(COIN_EMOJI);
+      isGenerated = !COIN_POOL.some(c => c[0] === ticker);
+    } else {
+      [ticker, emoji] = pick(COIN_POOL);
+    }
     const price = +(rand(0.0001, 4)).toFixed(6);
     const move = +(rand(-9,9)).toFixed(2);
-    return { ticker: name, emoji, price, move, history: this.genHistory(move) };
+    return { ticker, emoji, price, move, isGenerated, history: this.genHistory(move) };
   },
   genHistory(bias){
     const pts = [];
@@ -837,16 +963,21 @@ const Ceremony = {
     const stepsRoot = overlay.querySelector("#cerSteps");
 
     const steps = [];
+    // §44 SCREEN 1 — headline is "MEME MADNESS COMPLETE!" with small CADE
+    // branding; §23's "YOUR MADNESS IS COMPLETE" is kept as the sub-line so both
+    // readings of the spec are satisfied.
     steps.push(`<div class="ceremony-step active">
+        <div class="ceremony-brand">${AssetManager.slot("cerLogo", AssetManager.paths.logo, "🐸", "")}<span>CADE</span></div>
         <div class="hero-art">🐸💥</div>
-        <div class="ceremony-big">YOUR MADNESS<br>IS COMPLETE</div>
+        <div class="ceremony-big">MEME MADNESS<br>COMPLETE!</div>
+        <div class="ceremony-sub">YOUR MADNESS IS COMPLETE</div>
       </div>`);
     steps.push(`<div class="ceremony-step">
         <div class="ceremony-big">SCORE COUNT</div>
         <div class="ceremony-count" id="cerCounter">${fmt(s.startingBalance)}</div>
       </div>`);
     steps.push(`<div class="ceremony-step">
-        <div class="ceremony-big">${s.netResult>=0?"NET RESULT":"NET RESULT"}</div>
+        <div class="ceremony-big">NET RESULT</div>
         <div class="ceremony-count" style="color:${s.netResult>=0?'#3FCF6E':'#FF4F4F'}">${s.netResult>=0?"+":""}${fmt(s.netResult)}</div>
       </div>`);
     if(s.largestPayout>0){
@@ -863,11 +994,16 @@ const Ceremony = {
         <div class="award-desc">${a.desc}</div>
       </div>`);
     });
+    // §44 SCREEN 9 — final celebration offers all four onward actions rather
+    // than only routing to the results screen.
     steps.push(`<div class="ceremony-step">
         <div class="ceremony-big">THAT'S MADNESS! 🎉</div>
         <div class="hero-art">🎊🏆🎊</div>
         <div class="ceremony-actions">
-          <button class="btn btn-yellow btn-block" onclick="Ceremony.finish()">SEE MY RESULTS</button>
+          <button class="btn btn-yellow btn-block" onclick="Ceremony.finishThen('share')">SHARE MY RUN</button>
+          <button class="btn btn-primary btn-block" onclick="Ceremony.finishThen('again')">PLAY AGAIN</button>
+          <button class="btn btn-block" onclick="Ceremony.finishThen('history')">VIEW HISTORY</button>
+          <button class="btn btn-block" onclick="Ceremony.finishThen('home')">BACK HOME</button>
         </div>
       </div>`);
 
@@ -912,6 +1048,17 @@ const Ceremony = {
     $("#ceremonyRoot").innerHTML = "";
     UI.renderSummary(this._session);
     Nav.go("summary");
+  },
+
+  // §44 SCREEN 9 — every onward action still lands on the results screen first
+  // (so the share card exists and the session stays viewable), then performs the
+  // chosen action on top of it.
+  finishThen(action){
+    this.finish();
+    if(action === "share") Game.shareOnX();
+    else if(action === "again") Game.playAgain();
+    else if(action === "history") Nav.go("history");
+    else if(action === "home") Nav.go("home");
   }
 };
 
@@ -975,20 +1122,7 @@ const UI = {
 
   renderHome(){
     this.updateHeaderPoints();
-    const canClaim = !STATE.lastClaim || (Date.now() - STATE.lastClaim >= 24*3600*1000);
-    const claimBtn = $("#claimBtn");
-    const status = $("#claimStatus");
-    if(canClaim){
-      claimBtn.style.display = "block";
-      claimBtn.disabled = false;
-      status.style.display = "none";
-    } else {
-      claimBtn.style.display = "none";
-      status.style.display = "block";
-      const remain = 24*3600*1000 - (Date.now()-STATE.lastClaim);
-      const h = Math.floor(remain/3600000), m = Math.floor((remain%3600000)/60000);
-      status.textContent = "20,000 POINTS CLAIMED ✓ — NEXT CLAIM IN " + h + "h " + m + "m";
-    }
+    this.renderClaimPanel();
     const grid = $("#boostGrid");
     grid.innerHTML = "";
     CONFIG.BOOST_ACTIONS.forEach(b=>{
@@ -1003,15 +1137,69 @@ const UI = {
     });
   },
 
+  /* §5 — the "NEXT CLAIM IN" line ticks down live, once per second, and flips
+     itself back to the claim button the moment the 24h window elapses. It used
+     to be rendered once with hour+minute precision, so a player sitting on the
+     home screen saw a frozen countdown and had to reload to claim again. */
+  _claimTimer: null,
+
+  renderClaimPanel(){
+    const claimBtn = $("#claimBtn");
+    const status = $("#claimStatus");
+    if(!claimBtn || !status) return;
+
+    const remain = STATE.lastClaim
+      ? CONFIG.DAILY_CLAIM_WINDOW_MS - (Date.now() - STATE.lastClaim)
+      : 0;
+
+    if(remain <= 0){
+      claimBtn.style.display = "block";
+      claimBtn.disabled = false;
+      claimBtn.textContent = "CLAIM " + fmt(CONFIG.DAILY_POINTS) + " POINTS";
+      status.style.display = "none";
+      this.stopClaimTicker();
+      return;
+    }
+
+    claimBtn.style.display = "none";
+    status.style.display = "block";
+    const pad = n => String(n).padStart(2, "0");
+    const h = Math.floor(remain / 3600000);
+    const m = Math.floor((remain % 3600000) / 60000);
+    const sec = Math.floor((remain % 60000) / 1000);
+    status.innerHTML = fmt(CONFIG.DAILY_POINTS) + " POINTS CLAIMED ✓ — NEXT CLAIM IN " +
+      `<span class="claim-countdown">${h}h ${pad(m)}m ${pad(sec)}s</span>`;
+
+    // No point ticking while the player is on another screen; Nav.go("home")
+    // calls renderHome() -> renderClaimPanel() again on the way back.
+    const home = document.getElementById("screen-home");
+    if(!home || !home.classList.contains("active")){ this.stopClaimTicker(); return; }
+    this.startClaimTicker();
+  },
+
+  startClaimTicker(){
+    if(this._claimTimer) return;
+    this._claimTimer = setInterval(()=> this.renderClaimPanel(), 1000);
+  },
+
+  stopClaimTicker(){
+    if(!this._claimTimer) return;
+    clearInterval(this._claimTimer);
+    this._claimTimer = null;
+  },
+
   renderCoin(coin){
     const up = coin.move >= 0;
     $("#coinCard").innerHTML = `
-      <div class="coin-logo">${AssetManager.slot("coin_"+coin.ticker, AssetManager.paths.coin(coin.ticker), coin.emoji, "coin-art-slot")}</div>
-      <div>
-        <div class="coin-name">${coin.ticker}</div>
-        <div class="coin-ticker">$${coin.ticker}</div>
-        <div class="coin-price">$${coin.price}</div>
-        <div class="coin-move ${up?'up':'down'}">${up?'+':''}${coin.move}%</div>
+      <div class="coin-meme">${MemeImage.render(coin)}</div>
+      <div class="coin-id">
+        <div class="coin-logo">${AssetManager.slot("coin_"+coin.ticker, AssetManager.paths.coin(coin.ticker), coin.emoji, "coin-art-slot")}</div>
+        <div>
+          <div class="coin-name">${coin.ticker}${coin.isGenerated?'<span class="new-coin-badge">NEW</span>':''}</div>
+          <div class="coin-ticker">$${coin.ticker}</div>
+          <div class="coin-price">$${coin.price}</div>
+          <div class="coin-move ${up?'up':'down'}">${up?'+':''}${coin.move}%</div>
+        </div>
       </div>`;
   },
 
@@ -1088,6 +1276,8 @@ const UI = {
     $("#confirmBtn").disabled = true;
     $("#confirmBtn").style.display = "block";
     $("#lockedBanner").style.display = "none";
+    const riskEl0 = $("#potRisk");
+    if(riskEl0) riskEl0.textContent = "0";
     $("#potProfit").textContent = "+0";
     $("#potLoss").textContent = "-0";
     document.querySelectorAll(".risk-grid, .updown, #customRisk").forEach(el=>el.style.pointerEvents="auto");
@@ -1096,6 +1286,10 @@ const UI = {
   updatePayoutPreview(){
     const mult = MarketEngine.getMultiplier(Round.risk||0);
     const profit = Math.round((Round.risk||0)*mult);
+    // §14 — the risk itself is shown alongside profit/loss so the three numbers
+    // read as one relationship, and all three update on every stake change.
+    const riskEl = $("#potRisk");
+    if(riskEl) riskEl.textContent = fmt(Round.risk||0);
     $("#potProfit").textContent = "+"+fmt(profit);
     $("#potLoss").textContent = "-"+fmt(Round.risk||0);
     this.updateTierBadge();
@@ -1318,7 +1512,12 @@ const UI = {
   renderHistory(){
     const list = $("#historyList");
     if(!STATE.history.length){
-      list.innerHTML = `<div class="card center muted">No completed sessions yet. Play your first Meme Madness run!</div>`;
+      list.innerHTML = `<div class="empty-state">
+        <span class="emo">📜</span>
+        <b>NO RUNS YET</b>
+        <p>Finish a Meme Madness session and it lands here with every round, award and net result.</p>
+        <button class="btn btn-primary mt16" onclick="Nav.go('arena')">START A RUN</button>
+      </div>`;
       return;
     }
     list.innerHTML = STATE.history.map((s,i)=>{
@@ -1355,9 +1554,14 @@ const UI = {
       { l:"MOST ROUNDS", v: r.mostRounds },
       { l:"MOST POINTS RISKED", v: fmt(r.mostRisked) }
     ];
+    // "no record yet" is now null rather than -Infinity (which JSON cannot
+    // represent). The old `> -Infinity` test passes for null too — null coerces
+    // to 0 — so a brand-new player was shown a bogus "+0" best session.
+    const hasNet = typeof r.bestSessionNet === "number";
+    const netStr = hasNet ? (r.bestSessionNet>=0?'+':'') + fmt(r.bestSessionNet) : '—';
     $("#recordsGrid").innerHTML = `<div class="muted small mt8" style="grid-column:1/-1;">These are your all-time bests across every completed session.</div>`
       + items.map(i=>`<div class="record-box"><div class="v">${i.v}</div><div class="l">${i.l}</div></div>`).join("")
-      + `<div class="record-box" style="grid-column:1/-1;"><div class="l">BEST SESSION NET</div><div class="v">${r.bestSessionNet>-Infinity ? (r.bestSessionNet>=0?'+':'')+fmt(r.bestSessionNet) : '—'}</div></div>`;
+      + `<div class="record-box" style="grid-column:1/-1;"><div class="l">BEST SESSION NET</div><div class="v">${netStr}</div></div>`;
   },
 
   renderSummary(s){

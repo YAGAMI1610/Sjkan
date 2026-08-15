@@ -99,50 +99,58 @@
 
       <div class="stats-strip" id="statsStrip"></div>
 
-      <div class="card coin-card" id="coinCard"></div>
-
-      <div class="chart-wrap card" id="chartCard"></div>
-
-      <div class="timer-wrap">
-        <div class="timer-circle" id="timerCircle">25</div>
-        <div class="predict-q">WHERE DO YOU THINK IT'S GOING?</div>
-      </div>
-
-      <div class="updown">
-        <button class="up-btn" id="upBtn" onclick="Game.selectPrediction('UP')">↑ UP</button>
-        <button class="down-btn" id="downBtn" onclick="Game.selectPrediction('DOWN')">↓ DOWN</button>
-      </div>
-
-      <div class="card mt16">
-        <b>HOW MANY POINTS DO YOU WANT TO RISK?</b>
-        <div class="risk-grid" id="riskGrid"></div>
-        <input type="number" id="customRisk" class="custom-risk" placeholder="Custom amount" style="display:none;" oninput="Game.setCustomRisk(this.value)" aria-label="Custom risk amount">
-        <div id="riskZeroNote" class="risk-zero-note" style="display:none;" role="status"></div>
-        <div id="tierBadgeWrap"></div>
-        <p class="payout-note">The more points you risk, the larger your potential payout — but the larger your potential loss.</p>
-
-        <div class="payout-preview">
-          <div class="payout-box profit"><div class="muted">POTENTIAL PROFIT</div><div class="val" id="potProfit">+0</div></div>
-          <div class="payout-box loss"><div class="muted">POTENTIAL LOSS</div><div class="val" id="potLoss">-0</div></div>
+      <!-- §39 — two columns on desktop: coin/chart/meme left, decision controls
+           right. Single stacked column on mobile, in the §38 order. -->
+      <div class="arena-cols">
+        <div class="arena-col arena-col-left">
+          <div class="card coin-card" id="coinCard"></div>
+          <div class="chart-wrap card" id="chartCard"></div>
         </div>
 
-        <button class="btn btn-primary btn-block confirm-btn" id="confirmBtn" onclick="Game.reviewPrediction()" disabled>CONFIRM PREDICTION</button>
-
-        <div id="reviewPanel" class="card purple mt16" style="display:none;">
-          <b>REVIEW YOUR PREDICTION</b>
-          <div class="payout-preview mt12" style="justify-content:space-between;">
-            <div class="muted">PREDICTION</div><div id="revPrediction" style="font-weight:900;"></div>
+        <div class="arena-col arena-col-right">
+          <div class="timer-wrap">
+            <div class="timer-circle" id="timerCircle">25</div>
+            <div class="predict-q">WHERE DO YOU THINK IT'S GOING?</div>
           </div>
-          <div class="flex-between mt8"><span class="muted">POINTS AT RISK</span><b id="revRisk"></b></div>
-          <div class="flex-between mt8"><span class="muted">POTENTIAL PROFIT</span><b id="revProfit"></b></div>
-          <div class="flex-between mt8"><span class="muted">POTENTIAL LOSS</span><b id="revLoss"></b></div>
-          <div class="hero-cta mt16">
-            <button class="btn btn-yellow btn-block" id="lockInBtn" onclick="Game.lockInPrediction()">LOCK IT IN</button>
-            <button class="btn btn-block" onclick="Game.cancelReview()">← CHANGE PREDICTION</button>
+
+          <div class="updown">
+            <button class="up-btn" id="upBtn" onclick="Game.selectPrediction('UP')">↑ UP</button>
+            <button class="down-btn" id="downBtn" onclick="Game.selectPrediction('DOWN')">↓ DOWN</button>
+          </div>
+
+          <div class="card mt16">
+            <b>HOW MANY POINTS DO YOU WANT TO RISK?</b>
+            <div class="risk-grid" id="riskGrid"></div>
+            <input type="number" id="customRisk" class="custom-risk" placeholder="Custom amount" style="display:none;" oninput="Game.setCustomRisk(this.value)" aria-label="Custom risk amount">
+            <div id="riskZeroNote" class="risk-zero-note" style="display:none;" role="status"></div>
+            <div id="tierBadgeWrap"></div>
+            <p class="payout-note">The more points you risk, the larger your potential payout — but the larger your potential loss.</p>
+
+            <div class="payout-preview">
+              <div class="payout-box risk"><div class="muted">YOUR RISK</div><div class="val" id="potRisk">0</div></div>
+              <div class="payout-box profit"><div class="muted">POTENTIAL PROFIT</div><div class="val" id="potProfit">+0</div></div>
+              <div class="payout-box loss"><div class="muted">POTENTIAL LOSS</div><div class="val" id="potLoss">-0</div></div>
+            </div>
+
+            <button class="btn btn-primary btn-block confirm-btn" id="confirmBtn" onclick="Game.reviewPrediction()" disabled>CONFIRM PREDICTION</button>
+
+            <div id="reviewPanel" class="card purple mt16" style="display:none;">
+              <b>REVIEW YOUR PREDICTION</b>
+              <div class="payout-preview mt12" style="justify-content:space-between;">
+                <div class="muted">PREDICTION</div><div id="revPrediction" style="font-weight:900;"></div>
+              </div>
+              <div class="flex-between mt8"><span class="muted">POINTS AT RISK</span><b id="revRisk"></b></div>
+              <div class="flex-between mt8"><span class="muted">POTENTIAL PROFIT</span><b id="revProfit"></b></div>
+              <div class="flex-between mt8"><span class="muted">POTENTIAL LOSS</span><b id="revLoss"></b></div>
+              <div class="hero-cta mt16">
+                <button class="btn btn-yellow btn-block" id="lockInBtn" onclick="Game.lockInPrediction()">LOCK IT IN</button>
+                <button class="btn btn-block" onclick="Game.cancelReview()">← CHANGE PREDICTION</button>
+              </div>
+            </div>
+
+            <div id="lockedBanner" class="locked-banner" style="display:none;"></div>
           </div>
         </div>
-
-        <div id="lockedBanner" class="locked-banner" style="display:none;"></div>
       </div>
     </div>
   </div>

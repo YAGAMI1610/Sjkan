@@ -77,13 +77,13 @@ to a sensible place when it closes.
   yet, since it wasn't feasible to run a real browser profiler in this pass.
 
 ## Part A, item 1 — real visual assets (completed this pass)
-No brand logo file was actually included in the uploaded project (the `assets/`
-folders only contained `.gitkeep` placeholders plus a generic `logo.svg`/
-`hero-artwork.svg`), so "use the supplied CADE logo, don't redraw it" couldn't
-be followed literally — there was nothing supplied to preserve. What's done
-instead, keeping everything swap-in-ready via `AssetManager` (`app.js`) which
-already tries a real file at a fixed path and silently falls back to emoji if
-missing — no layout code needs to change when real art is dropped in later:
+The upload contained one real brand asset (`assets/logo.jpg`) and a placeholder
+`hero-artwork.svg`; the `coins/`, `awards/` and `avatars/` folders held only
+`.gitkeep` files. So "use the supplied CADE logo, don't redraw it" applies to
+the logo and was followed literally — it is untouched. Everything else had to be
+drawn. What's done, keeping it all swap-in-ready via `AssetManager` (`app.js`)
+which tries a real file at a fixed path and silently falls back to a placeholder
+if it's missing — no layout code changes when real art arrives later:
 
 - **20 distinct coin logos** generated at `assets/coins/<ticker>.svg` (all
   tickers in `COIN_POOL`: MOONFROG, BONKCAT, GIGAAPE, FROGGO, MEMEDOG, CHADINU,
@@ -91,8 +91,11 @@ missing — no layout code needs to change when real art is dropped in later:
   TURBOSNAIL, DIAMONDHAMSTER, SADCLOWN, GIGACHAD, MOONPIG, CRYOWL, SPICYTACO).
   Each is a chunky coin badge with a deterministic accent color (hashed from
   the ticker) and its own initial + ticker text — not a single reused shape.
-  Coins generated dynamically beyond this pool at runtime still gracefully
-  fall back to the emoji placeholder, by design.
+  Coins minted dynamically beyond this pool at runtime (§8) have no file on
+  disk and never will, so they fall through `AssetManager` to the emoji
+  placeholder for the logo and to a drawn `MemeImage` panel (below) for the
+  round art — neither shows a broken-image box, and both are deterministic per
+  ticker, so a minted coin looks the same on every appearance.
 - **8 visually distinct award badges** at `assets/awards/<code>.svg` — each is
   a genuinely different shape/composition, not the same badge recolored:
   Meme Star (5-point star + sparkles), Grinder (hexagon shield + flame),
@@ -107,27 +110,133 @@ missing — no layout code needs to change when real art is dropped in later:
   illustration (ascending chart line, coin badges, sparkles) in the CADE
   palette — the old file was literally a placeholder rectangle with the
   words "MEME MADNESS ARTWORK PLACEHOLDER" on it.
-- **Logo** (`assets/logo.svg`) left as-is: a simple "C" badge in CADE yellow/
-  black. This is a stand-in, not final brand art — swap in the real CADE
-  logo file at this exact path whenever it's available and nothing else
-  needs to change.
-- **MemeImage** (supporting per-round art): no dedicated slot existed for
-  this in the current UI (`app.js`/`index.html`) beyond the coin logo itself
-  — flagged here rather than silently skipped. If a separate "meme image per
-  round" surface is wanted (e.g. in the coin card or result overlay), that's
-  a small follow-up: add an `AssetManager.paths.memeImage` entry plus a slot
-  call in the coin-card render function, following the exact same pattern as
-  coins/awards/avatars above.
+- **Logo** (`assets/logo.jpg`) is the one real brand asset that *was* supplied
+  in the upload, so it was left exactly as-is and not redrawn. `AssetManager`
+  points at it directly (note the `.jpg` — it is the only non-SVG slot). An
+  earlier draft of these notes described a placeholder "C" badge at
+  `assets/logo.svg`; no such file exists or is referenced.
+- **MemeImage** (per-round art) — **now implemented.** `MemeImage` in `app.js`
+  draws a 200×140 comic panel per round (sunburst rays, halftone dots, the
+  coin's emoji as the character, a black footer bar with `$TICKER`, 4px black
+  outline) with the accent colour and ray count hashed from the ticker, so a
+  coin looks identical every time it appears and no two coins look alike. It
+  renders through `AssetManager.slotHTML()` at `assets/memes/<ticker>.svg`, so
+  dropping a real file at that path replaces the drawn panel with no code
+  change — same pattern as coins/awards/avatars. The panel is the fallback
+  rather than a bare emoji specifically because dynamically minted tickers
+  (below) will never have a file on disk.
 
-All 39 new SVGs were validated as well-formed XML. I don't have a browser
-renderer available in this environment to screenshot them, so a quick visual
-glance in-browser after deploying is still worth doing, but the shapes/colors
-were composed by hand against the CADE palette (black/cream/purple/yellow/
-orange, chunky arcade outlines, no gradients/neon/hologram effects) to match
-the existing UI.
+  This is why `slotHTML()` exists alongside `slot()`: `slot()` round-trips its
+  placeholder through a `data-fallback` attribute, which breaks the moment the
+  placeholder is markup containing quotes.
+
+All 38 SVGs under `assets/` were validated as well-formed XML. I don't have a
+browser renderer available in this environment to screenshot them, so a quick
+visual glance in-browser after deploying is still worth doing, but the
+shapes/colors were composed by hand against the CADE palette (black/cream/
+purple/yellow/orange, chunky arcade outlines, no gradients/neon/hologram
+effects) to match the existing UI.
+
+## Spec conformance pass (§2, §5, §8, §14, §39, §40, §41, §44)
+An audit against the build spec turned up eight places where the code was
+close but not conformant. All eight are now closed:
+
+- **§8 — coin pool is no longer a fixed list.** `MarketEngine.generateCoin()`
+  mints new tickers from `COIN_PREFIXES` × `COIN_SUFFIXES` on top of
+  `COIN_POOL`, so a long session keeps introducing coins the player hasn't
+  seen. Minted coins carry a `NEW` badge in the coin card for one round.
+- **§41 — accounts carry a `userId`.** Generated once, persisted, and sent as
+  the device identity, so the server can link a returning browser to its
+  account without a login.
+- **§2/§40 — per-round meme art.** See the `MemeImage` note above.
+- **§14 — the risk panel shows the full relationship.** It was showing stake
+  and potential profit; it now shows **YOUR RISK / POTENTIAL PROFIT /
+  POTENTIAL LOSS** as three boxes, in both the static markup and the JS that
+  updates them, so a player can see what a wrong call costs before locking in.
+- **§44 — the ceremony has all nine screens.** Screens 1 (brand intro) and 9
+  (exit) were missing; both are in, and all four documented exits out of the
+  ceremony (skip, tap-through, auto-advance, and the final CTA) land somewhere
+  sensible instead of leaving the overlay up.
+- **§39 — desktop is a two-column arena.** Above 900px the market side (coin,
+  meme, chart) sits in a sticky left column and the decision side (timer,
+  UP/DOWN, risk, confirm) in the right, so a desktop player isn't scrolling
+  between the chart and the buttons during a 25-second round. Below 900px it
+  collapses to the single stacked column in the §38 order — unchanged. The
+  sticky column is disabled under `prefers-reduced-motion`.
+- **§5 — the claim countdown ticks.** "NEXT CLAIM IN" was rendered once at
+  hour+minute precision, so a player sitting on the home screen watched a
+  frozen number and had to reload to discover the window had reopened. It now
+  updates once a second and swaps itself back to the claim button the moment
+  the 24h window elapses. The interval only runs while the home screen is
+  actually visible.
+
+## Two more bugs found and fixed in this pass
+- **`renderRecords()` showed a fake "+0" best session to new players.**
+  `bestSessionNet` was changed from `-Infinity` to `null` (JSON can't carry
+  `-Infinity`), but the render still tested `> -Infinity`, which `null` passes
+  by coercing to 0. Now type-checked, and a fresh account shows `—`.
+- **`Round.begin()` painted the new round *after* awaiting the outcome.** On
+  static hosting the local simulation resolves instantly so this was invisible,
+  but against any real backend the arena kept showing the *previous* round's
+  coin, price, chart and round number for the whole round-trip. None of that
+  markup depends on the outcome, so it now paints first and awaits second — and
+  the 25-second countdown starts only once the outcome is in hand, so no player
+  loses seconds off their round to network latency.
+
+## UI/UX upgrade (this pass)
+Beyond the §39/§14/§5 changes above: hover lift on buttons, chips, tabs and
+rows (`@media (hover:hover)` only, so it never sticks on touch); a pulse on the
+timer in its final seconds; an inset yellow ring on the selected risk chip so
+the selection reads at a glance against the hard shadow; a proper
+`.empty-state` for history with a "START A RUN" call to action instead of a
+bare line of grey text; and a `prefers-reduced-motion` block that disables the
+lot. Nothing added is load-bearing — every animation degrades to a static
+state.
+
+## Automated test suite (new)
+`npm test` runs two harnesses — **92 checks, 0 failures** — and `npm run lint`
+runs `node --check` over all four JS files.
+
+**`test/smoke-test.js`** (59 checks) boots the real `index.html` + `app.js` in
+jsdom with `fetch` stubbed to reject, which is what forces the local
+simulation path the static build actually uses. `Math.random` is a seeded LCG,
+so a failure reproduces. It covers: boot with no unhandled errors; a
+self-maintaining dangling-`id` check (every id read by the JS must be declared
+in `index.html` *or* emitted by the JS itself, so a read with no writer
+anywhere still fails); the daily claim including the live tick and the ticker
+starting/stopping on navigation; dynamic coin minting and `MemeImage`
+determinism; the paint-before-outcome ordering above; the full prediction flow;
+10,000 outcomes asserting `dir` never contradicts the sign of `pct`, and 60,000
+asserting the distribution is near-fair (P(UP) ≈ 49.2%); the balance math; a
+12-round session end-to-end; the ceremony and all four §44 exits; records;
+every other screen; and persistence across a reload.
+
+One jsdom detail worth knowing before editing this file: a top-level `const` in
+a browser lands in the global *lexical* scope, not on `window`, so it is
+reachable from inline `onclick=` handlers but never as `window.X`. jsdom also
+scopes each `window.eval()` call separately. Both are why the harness
+concatenates all three scripts into a **single** eval and appends a `BRIDGE`
+epilogue that hangs the internals on `window.__app`. Splitting that eval, or
+reaching for `window.Game`, will fail with `ReferenceError`.
+
+**`test/server-test.js`** (33 checks) boots `server/server.js` on an ephemeral
+port and exercises every endpoint the client calls. This is the half of the
+build where the damaging bugs lived, precisely because they're unreachable from
+the static app: the client falls back to local simulation, so a broken server
+looks like a working game right up until the backend is deployed. It pins the
+`round.profit` NaN bug (a field the client never sends, which turned the
+balance into `NaN` on the first win — permanently, and poisoned the leaderboard
+and records with it), the DOWN-with-a-positive-percentage rows, the `dir:"FLAT"`
+row the client can never match, and `bestSessionNet: -Infinity`. It also
+asserts the client and server agree on `PAYOUT_MULTIPLIER` and `DAILY_POINTS`,
+so the two halves can't drift apart silently.
 
 ## Summary
-Items 14 and 15 are now addressed in code (this pass) with the specific
-diffs listed above. Item 13 requires a hands-on device pass; the layout/tap
-target work above should make that pass go smoothly, and a checklist is
-included so it's a quick, well-scoped QA task rather than an open-ended one.
+Items 14 and 15 are addressed in code with the specific diffs listed above,
+as are the eight spec gaps and the two bugs. Item 13 still requires a hands-on
+device pass; the layout/tap-target work above should make that pass go
+smoothly, and a checklist is included so it's a quick, well-scoped QA task
+rather than an open-ended one. The screen-reader pass on the dynamically
+injected overlays (noted under item 14) is likewise still open — the automated
+suite asserts those overlays open, populate and close correctly, but it can't
+speak to how they're announced.

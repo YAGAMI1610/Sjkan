@@ -156,7 +156,23 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
   margin:0 auto;font-size:2.6rem;font-weight:900;box-shadow:6px 6px 0 var(--black);
 }
 .timer-circle.urgent{background:var(--red-a11y);color:var(--white);}
-.coin-card{display:flex;align-items:center;gap:14px;}
+/* §2/§40 — the coin card is now a vertical stack: meme panel on top, coin
+   identity row beneath it. `.coin-id` keeps the original horizontal layout. */
+.coin-card{display:flex;flex-direction:column;gap:14px;}
+.coin-meme{width:100%;}
+.meme-art-slot{
+  display:block;width:100%;aspect-ratio:200/140;
+  border-radius:10px;overflow:hidden;background:var(--cream);
+}
+.meme-art-slot svg,.meme-art-slot img{width:100%;height:100%;display:block;object-fit:cover;}
+.coin-id{display:flex;align-items:center;gap:14px;}
+.coin-name{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+/* §8 — flags a dynamically minted ticker the player has never seen before */
+.new-coin-badge{
+  background:var(--purple);color:var(--cream);border:2px solid var(--black);
+  border-radius:999px;padding:2px 8px;font-size:.6rem;font-weight:900;
+  letter-spacing:1px;line-height:1.4;flex:none;
+}
 .coin-logo{
   width:64px;height:64px;border-radius:50%;background:var(--orange);
   border:3px solid var(--black);display:flex;align-items:center;justify-content:center;
@@ -197,11 +213,20 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .risk-chip.selected{background:var(--purple);color:var(--cream);}
 .custom-risk{margin-top:10px;width:100%;padding:12px;border:3px solid var(--black);border-radius:12px;font-weight:900;font-size:1rem;}
 
-.payout-preview{display:flex;justify-content:space-between;gap:10px;margin-top:14px;}
-.payout-box{flex:1;text-align:center;border:3px solid var(--black);border-radius:14px;padding:10px;}
+/* §14 — three boxes now (YOUR RISK / POTENTIAL PROFIT / POTENTIAL LOSS), so the
+   labels are tightened to keep them on one or two lines on a narrow phone. */
+.payout-preview{display:flex;justify-content:space-between;gap:8px;margin-top:14px;}
+.payout-box{flex:1;min-width:0;text-align:center;border:3px solid var(--black);border-radius:14px;padding:10px 6px;}
+.payout-box.risk{background:#EFE7FF;}
 .payout-box.profit{background:#DFFBE8;}
 .payout-box.loss{background:#FFE4E4;}
-.payout-box .val{font-size:1.3rem;font-weight:900;}
+.payout-box .muted{font-size:.62rem;letter-spacing:.3px;line-height:1.25;}
+.payout-box .val{font-size:1.15rem;font-weight:900;margin-top:4px;}
+@media(min-width:430px){
+  .payout-preview{gap:10px;}
+  .payout-box .muted{font-size:.7rem;}
+  .payout-box .val{font-size:1.3rem;}
+}
 .payout-note{font-size:.75rem;color:#555;margin-top:10px;font-weight:600;text-align:center;}
 
 .confirm-btn{margin-top:16px;}
@@ -369,3 +394,99 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,
 .center{text-align:center;}
 .flex-between{display:flex;justify-content:space-between;align-items:center;}
 .mt8{margin-top:8px;}.mt12{margin-top:12px;}.mt16{margin-top:16px;}.mt24{margin-top:24px;}
+
+/* =========================================================
+   §44 — CEREMONY SCREEN 1 BRANDING
+   ========================================================= */
+.ceremony-brand{
+  display:flex;align-items:center;justify-content:center;gap:9px;
+  font-weight:900;font-size:1.05rem;letter-spacing:2px;margin-bottom:6px;
+}
+.ceremony-brand .art-slot{
+  width:34px;height:34px;flex:none;border-radius:50%;overflow:hidden;
+  background:var(--sunburst-a);color:var(--black);border:3px solid var(--black);
+  font-size:.95rem;
+}
+.ceremony-sub{
+  margin-top:12px;font-weight:900;font-size:.75rem;letter-spacing:2px;
+  color:var(--black);background:var(--yellow);display:inline-block;
+  padding:5px 14px;border-radius:999px;border:2px solid var(--black);
+}
+
+/* =========================================================
+   §5 — LIVE DAILY-CLAIM COUNTDOWN
+   ========================================================= */
+.claim-countdown{font-variant-numeric:tabular-nums;font-weight:900;color:var(--black);}
+
+/* =========================================================
+   §39 — DESKTOP ARENA LAYOUT
+   Mobile keeps the single stacked column in §38 order. From 900px the arena
+   splits: coin identity + meme + chart on the left (sticky, so the market stays
+   in view), every decision control on the right.
+   ========================================================= */
+.arena-cols{display:block;}
+@media(min-width:900px){
+  .arena-cols{
+    display:grid;
+    grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+    gap:22px;align-items:start;
+  }
+  .arena-col-left{position:sticky;top:88px;}
+  .arena-col-right > .timer-wrap{margin-top:0;}
+  .arena-col-right > .card.mt16{margin-top:14px;}
+  .timer-circle{width:104px;height:104px;font-size:2.2rem;}
+  .predict-q{margin-top:12px;}
+}
+@media(min-width:900px) and (prefers-reduced-motion: reduce){
+  .arena-col-left{position:static;}
+}
+
+/* =========================================================
+   UI/UX POLISH
+   ========================================================= */
+/* Hover affordance on the comic buttons — lifts off its hard shadow. */
+@media(hover:hover){
+  .btn:hover:not(:disabled),.risk-chip:hover:not(:disabled),
+  .tab-btn:hover,.updown button:hover:not(:disabled){
+    transform:translate(-1px,-1px);
+    box-shadow:7px 7px 0 var(--black);
+  }
+  .btn:hover:not(:disabled){box-shadow:6px 6px 0 var(--black);}
+  .lb-row:hover,.hist-card:hover,.vote-card:hover,.boost-card:hover{transform:translate(-1px,-1px);}
+}
+.risk-chip,.tab-btn,.lb-row,.hist-card,.vote-card,.boost-card,.updown button{
+  transition:transform .08s, box-shadow .08s, background .12s;
+}
+.risk-chip:active,.tab-btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--black);}
+/* Selected risk chip earns a heavier outline so the choice reads at a glance. */
+.risk-chip.selected{box-shadow:3px 3px 0 var(--black),inset 0 0 0 2px var(--yellow);}
+
+/* Countdown urgency: the last 5 seconds pulse rather than just recolour. */
+.timer-circle{transition:background .2s,color .2s;}
+.timer-circle.urgent{animation:timerPulse .9s ease-in-out infinite;}
+@keyframes timerPulse{
+  0%,100%{transform:scale(1);box-shadow:6px 6px 0 var(--black);}
+  50%{transform:scale(1.06);box-shadow:8px 8px 0 var(--black);}
+}
+
+/* Locked banner reads as a state change, not just another card. */
+.locked-banner{border:var(--border) solid var(--black);box-shadow:5px 5px 0 var(--purple);}
+
+.risk-zero-note{
+  margin-top:10px;background:#FFE4E4;border:3px solid var(--black);
+  border-radius:12px;padding:10px;font-weight:900;font-size:.8rem;text-align:center;
+}
+
+/* Empty states (history, votes, leaderboard) — centred, muted, never blank. */
+.empty-state{
+  text-align:center;padding:34px 18px;border:4px dashed var(--black);
+  border-radius:var(--radius);background:var(--white);
+}
+.empty-state .emo{font-size:2.6rem;display:block;margin-bottom:8px;}
+.empty-state b{display:block;font-size:1.05rem;}
+.empty-state p{margin-top:6px;font-weight:600;color:#666;font-size:.85rem;}
+
+@media (prefers-reduced-motion: reduce){
+  .timer-circle.urgent{animation:none;}
+  *{scroll-behavior:auto !important;}
+}
