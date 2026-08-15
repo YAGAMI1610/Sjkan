@@ -93,14 +93,20 @@ const SIM_PLAYERS_BASE = [
   { name: "ROCKET RIDER", avatar: "🛸" }
 ];
 
+// NOTE: `dir` is deliberately NOT stored here — it is derived from the sign of
+// the rolled percentage by MarketEngine.dirFromPct(). Storing both independently
+// let them contradict each other: FLAT used to be hard-coded dir:"DOWN" while
+// rolling a pct anywhere in [-0.5, +0.5], so ~4% of rounds rendered the
+// self-contradictory "TICKER went DOWN (+0.32%)" and lost the round for a player
+// who had correctly predicted UP. Deriving the direction makes that unrepresentable.
 const OUTCOMES = [
-  { key: "STRONG_UP", dir: "UP", weight: 10, pct: [8, 18] },
-  { key: "UP", dir: "UP", weight: 20, pct: [2, 8] },
-  { key: "SLIGHT_UP", dir: "UP", weight: 15, pct: [0.2, 2] },
-  { key: "FLAT", dir: "DOWN", weight: 8, pct: [-0.5, 0.5] },
-  { key: "SLIGHT_DOWN", dir: "DOWN", weight: 15, pct: [-2, -0.2] },
-  { key: "DOWN", dir: "DOWN", weight: 20, pct: [-8, -2] },
-  { key: "STRONG_DOWN", dir: "DOWN", weight: 12, pct: [-18, -8] }
+  { key: "STRONG_UP", weight: 10, pct: [8, 18] },
+  { key: "UP", weight: 20, pct: [2, 8] },
+  { key: "SLIGHT_UP", weight: 15, pct: [0.2, 2] },
+  { key: "FLAT", weight: 8, pct: [-0.5, 0.5] },
+  { key: "SLIGHT_DOWN", weight: 15, pct: [-2, -0.2] },
+  { key: "DOWN", weight: 20, pct: [-8, -2] },
+  { key: "STRONG_DOWN", weight: 12, pct: [-18, -8] }
 ];
 
 const AWARD_DEFS = {
@@ -124,7 +130,12 @@ function defaultState(){
     history: [],
     records: {
       highestBalance: 0, biggestPayout: 0, bestWinRate: 0,
-      longestStreak: 0, mostRounds: 0, mostRisked: 0, bestSessionId: null, bestSessionNet: -Infinity
+      // `null` (not -Infinity) is the "no session recorded yet" sentinel:
+      // JSON.stringify(-Infinity) serialises to null anyway, so the original
+      // -Infinity silently became null on the first save/load cycle and
+      // `netResult > null` then evaluates as `netResult > 0` — meaning a first
+      // session that finished down never got recorded as the best one.
+      longestStreak: 0, mostRounds: 0, mostRisked: 0, bestSessionId: null, bestSessionNet: null
     },
     leaderboard: null, // {players:[...], lastUpdate}
     votes: null,
@@ -193,11 +204,16 @@ const Nav = {
 const Game = {
 
   async claimDaily(){
-    // #12 — server enforces the real 24h window; local check below is just
-    // an instant-feedback fallback for when no backend is reachable.
+    // #12 — server enforces the real 24h window; the local closure below is the
+    // instant-feedback fallback for when no backend is reachable.
     const now = Date.now();
     try{
-      await Api.claimDaily(async ()=>{
+      // NOTE: only ONE of these two paths runs. When a backend is reachable the
+      // local closure is never invoked, so the balance credit has to come from
+      // the server's response — previously it didn't, and the code read
+      // `STATE.balance = STATE.balance` (a no-op), leaving the player with a
+      // "+20,000 POINTS CLAIMED!" toast and no points.
+      const res = await Api.claimDaily(async ()=>{
         if(STATE.lastClaim && now - STATE.lastClaim < 24*3600*1000){
           const err = new Error("Already claimed"); err.status = 429; throw err;
         }
@@ -206,12 +222,12 @@ const Game = {
         saveState();
         return { balance: STATE.balance, claimed: CONFIG.DAILY_POINTS };
       });
-      STATE.balance = STATE.balance; // balance already applied locally above; server confirms
+      if(res && typeof res.balance === "number") STATE.balance = res.balance;
       STATE.lastClaim = now;
       saveState();
       UI.renderHome();
       UI.updateHeaderPoints();
-      toast("+" + fmt(CONFIG.DAILY_POINTS) + " POINTS CLAIMED!");
+      toast("+" + fmt((res && res.claimed) || CONFIG.DAILY_POINTS) + " POINTS CLAIMED!");
     }catch(e){
       toast("Already claimed. Come back later!");
     }
@@ -221,17 +237,21 @@ const Game = {
     if(STATE.boosts[id]) return;
     const def = CONFIG.BOOST_ACTIONS.find(b=>b.id===id);
     try{
-      await Api.doBoost(id, async ()=>{
+      // Same one-path-only caveat as claimDaily above: take the balance from the
+      // server response when it served the request, otherwise from the local
+      // closure that already applied it.
+      const res = await Api.doBoost(id, async ()=>{
         STATE.boosts[id] = true;
         STATE.balance += def.reward;
         saveState();
         return { balance: STATE.balance, awarded: def.reward };
       });
+      if(res && typeof res.balance === "number") STATE.balance = res.balance;
       STATE.boosts[id] = true;
       saveState();
       UI.renderHome();
       UI.updateHeaderPoints();
-      toast("+" + fmt(def.reward) + " POINTS — " + def.label);
+      toast("+" + fmt((res && res.awarded) || def.reward) + " POINTS — " + def.label);
     }catch(e){
       toast("That boost was already claimed.");
     }
@@ -543,17 +563,22 @@ const MarketEngine = {
     }
     return pts;
   },
+  // Single source of truth for direction. Any outcome whose rolled percentage is
+  // >= 0 is an UP move, anything below is DOWN — so the direction the player is
+  // scored against always matches the percentage the UI shows them.
+  dirFromPct(pctVal){ return pctVal >= 0 ? "UP" : "DOWN"; },
+
   generateOutcome(){
     const total = OUTCOMES.reduce((a,o)=>a+o.weight,0);
     let r = rand(0,total);
     for(const o of OUTCOMES){
       if(r < o.weight){
         const pctVal = +(rand(o.pct[0], o.pct[1])).toFixed(2);
-        return Object.assign({}, o, { pctVal });
+        return Object.assign({}, o, { pctVal, dir: this.dirFromPct(pctVal) });
       }
       r -= o.weight;
     }
-    return Object.assign({}, OUTCOMES[0], { pctVal: 1 });
+    return Object.assign({}, OUTCOMES[0], { pctVal: 1, dir: "UP" });
   },
   getMultiplier(riskAmount){
     if(!CONFIG.USE_TIERED_PAYOUT) return CONFIG.PAYOUT_MULTIPLIER;
@@ -592,7 +617,7 @@ const Records = {
     r.longestStreak = Math.max(r.longestStreak, s.longestWinStreak);
     r.mostRounds = Math.max(r.mostRounds, s.totalRounds);
     r.mostRisked = Math.max(r.mostRisked, s.totalRisked);
-    if(s.netResult > r.bestSessionNet){
+    if(r.bestSessionNet === null || r.bestSessionNet === undefined || s.netResult > r.bestSessionNet){
       r.bestSessionNet = s.netResult;
       r.bestSessionId = s.sessionId;
     }

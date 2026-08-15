@@ -53,17 +53,27 @@ const CONFIG = {
 };
 
 // Same weighted outcome model as MarketEngine.generateOutcome() client-side.
+// `dir` is NOT stored: it is derived from the sign of the rolled percentage by
+// dirFromPct(), so the direction a round is scored against can never contradict
+// the percentage the client displays. The DOWN rows below previously carried
+// POSITIVE pct ranges ([0.5,4], [4,12], [12,40]) while being labelled DOWN, so
+// every server-generated down-move rendered as "TICKER went DOWN (+7.31%)".
 const OUTCOMES = [
-  { key: "STRONG_UP",   dir: "UP",   weight: 8,  pct: [12, 40] },
-  { key: "UP",          dir: "UP",   weight: 20, pct: [4, 12] },
-  { key: "SLIGHT_UP",   dir: "UP",   weight: 17, pct: [0.5, 4] },
-  { key: "FLAT",        dir: "FLAT", weight: 10, pct: [-0.5, 0.5] },
-  { key: "SLIGHT_DOWN", dir: "DOWN", weight: 17, pct: [0.5, 4] },
-  { key: "DOWN",        dir: "DOWN", weight: 20, pct: [4, 12] },
-  { key: "STRONG_DOWN", dir: "DOWN", weight: 8,  pct: [12, 40] }
+  { key: "STRONG_UP",   weight: 8,  pct: [12, 40] },
+  { key: "UP",          weight: 20, pct: [4, 12] },
+  { key: "SLIGHT_UP",   weight: 17, pct: [0.5, 4] },
+  { key: "FLAT",        weight: 10, pct: [-0.5, 0.5] },
+  { key: "SLIGHT_DOWN", weight: 17, pct: [-4, -0.5] },
+  { key: "DOWN",        weight: 20, pct: [-12, -4] },
+  { key: "STRONG_DOWN", weight: 8,  pct: [-40, -12] }
 ];
 
 function rand(min, max){ return Math.random() * (max - min) + min; }
+
+// Single source of truth for direction, mirroring MarketEngine.dirFromPct().
+// Note the client can only ever predict "UP" or "DOWN", so emitting any third
+// direction (the old dir:"FLAT" row) made 10% of rounds unwinnable by anyone.
+function dirFromPct(pctVal){ return pctVal >= 0 ? "UP" : "DOWN"; }
 
 /* ---------------------------------------------------------
    STORE — in-memory reference implementation
@@ -85,7 +95,9 @@ const Store = {
         records: {
           highestBalance: 0, biggestPayout: 0, bestWinRate: 0,
           longestStreak: 0, mostRounds: 0, mostRisked: 0,
-          bestSessionNet: -Infinity, bestSessionId: null
+          // null, not -Infinity: -Infinity is not representable in JSON and
+          // serialises to null on the way to the client anyway.
+          bestSessionNet: null, bestSessionId: null
         },
         votesByRound: {},      // roundId -> true (one vote per round)
         submittedMemes: []
@@ -151,17 +163,30 @@ app.post("/api/round/outcome", auth, (req, res) => {
   }
   const pctVal = +(rand(chosen.pct[0], chosen.pct[1])).toFixed(2);
   const roundId = "rnd_" + Date.now().toString(36) + Math.floor(rand(100,999));
-  const outcome = Object.assign({}, chosen, { pctVal, roundId });
+  const outcome = Object.assign({}, chosen, { pctVal, dir: dirFromPct(pctVal), roundId });
 
-  // Store server-side; the client only gets `outcome` back once its own
-  // timer expires, matching the existing 25s round flow, but a truly
-  // strict deployment would also gate this endpoint on elapsed time
-  // measured server-side (e.g. round start timestamp) rather than trust
-  // the client to only call it at t=0.
+  // Store server-side. NOTE: this map is currently write-only — the
+  // `/round/resolve` endpoint referenced in earlier revisions of this comment
+  // does not exist yet, so nothing reads these entries back. They are swept on a
+  // TTL below to stop the map growing without bound for the lifetime of the
+  // process. A strict deployment would also gate this endpoint on elapsed time
+  // measured server-side (from a round-start timestamp) rather than trusting the
+  // client to only call it at t=0.
   Store.pendingRounds.set(roundId, { outcome, deviceId: req.account.deviceId, createdAt: Date.now(), resolved: false });
 
   res.json({ outcome });
 });
+
+// Sweep pending-round entries well past any plausible round length so the map
+// cannot grow unbounded. Raise PENDING_ROUND_TTL_MS if /round/resolve lands and
+// needs a longer window to look outcomes back up.
+const PENDING_ROUND_TTL_MS = 10 * 60 * 1000;
+setInterval(()=>{
+  const cutoff = Date.now() - PENDING_ROUND_TTL_MS;
+  for(const [roundId, entry] of Store.pendingRounds){
+    if(entry.createdAt < cutoff) Store.pendingRounds.delete(roundId);
+  }
+}, 60 * 1000).unref?.();
 
 // #12 — daily claim, enforced server-side regardless of client clock/localStorage.
 app.post("/api/daily-claim", auth, (req, res) => {
@@ -202,8 +227,13 @@ app.post("/api/round/submit", auth, (req, res) => {
     return res.status(400).json({ error: "No matching active session" });
   }
   // Apply the round's balance delta server-side so balance is authoritative.
-  if(round.result === "WIN") acct.balance += round.profit;
-  if(round.result === "LOSS") acct.balance -= round.riskAmount;
+  // `payout` is the client's already-signed delta (+profit on a WIN, -risk on a
+  // LOSS, 0 on a SKIPPED round), so one addition covers every result type.
+  // This previously read `acct.balance += round.profit` — the client's round
+  // record has no `profit` field, so the account balance became NaN on the very
+  // first win and stayed NaN forever (poisoning the leaderboard and records too).
+  const delta = Number(round && round.payout);
+  if(Number.isFinite(delta)) acct.balance += delta;
   acct.activeSession.rounds = acct.activeSession.rounds || [];
   acct.activeSession.rounds.push(round);
   res.json({ ok: true, balance: acct.balance });
@@ -223,8 +253,8 @@ app.post("/api/session/end", auth, (req, res) => {
   r.longestStreak = Math.max(r.longestStreak, s.longestWinStreak || 0);
   r.mostRounds = Math.max(r.mostRounds, s.totalRounds || 0);
   r.mostRisked = Math.max(r.mostRisked, s.totalRisked || 0);
-  if((s.netResult || 0) > r.bestSessionNet){
-    r.bestSessionNet = s.netResult;
+  if(r.bestSessionNet === null || r.bestSessionNet === undefined || (s.netResult || 0) > r.bestSessionNet){
+    r.bestSessionNet = s.netResult || 0;
     r.bestSessionId = s.sessionId;
   }
   res.json({ ok: true, balance: acct.balance, records: r });

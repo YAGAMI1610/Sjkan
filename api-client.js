@@ -67,12 +67,27 @@ const Api = (function(){
   return {
     deviceId,
 
-    /** #9 — server-authoritative round outcome generation */
+    /** #9 — server-authoritative round outcome generation.
+     *  Normalises the two code paths onto ONE contract: a bare outcome object
+     *  `{key, pctVal, dir, ...}`. The server wraps its payload as `{outcome:{...}}`
+     *  while the local fallback returns the outcome directly, so without this
+     *  unwrap `outcome.dir`/`outcome.pctVal` came back undefined whenever a
+     *  backend was reachable — scoring every round a loss and rendering
+     *  "TICKER went undefined (undefined%)".
+     *  `dir` is also re-derived from the sign of pctVal rather than trusted, so a
+     *  server that sends a mismatched or unsupported direction (e.g. "FLAT",
+     *  which the client can never match against UP/DOWN) cannot silently turn
+     *  every affected round into a loss. */
     async getRoundOutcome(localGenerateFn){
-      return withFallback(
+      const res = await withFallback(
         ()=> request("/round/outcome", { method: "POST" }),
         localGenerateFn
       );
+      const outcome = (res && res.outcome) ? res.outcome : res;
+      if(outcome && typeof outcome.pctVal === "number"){
+        outcome.dir = outcome.pctVal >= 0 ? "UP" : "DOWN";
+      }
+      return outcome;
     },
 
     /** #12 — server enforces the 24h window; throws {status:429} if too early */
