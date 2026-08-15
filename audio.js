@@ -37,14 +37,27 @@ const AudioHooks = (function(){
   let unlocked = false;
   let muted = true; // muted-by-default-on-load, per browser autoplay policy
 
+  /* localStorage throws — not returns null — when storage is disabled: Safari
+     private browsing, "block all cookies", sandboxed iframes without
+     allow-same-origin. An unguarded getItem here threw during module evaluation,
+     which aborted this script entirely, leaving `AudioHooks` undefined and every
+     `AudioHooks.play(...)` call in app.js a hard ReferenceError. The mute
+     preference simply not persisting is the correct degradation. */
+  function readStore(key){
+    try{ return localStorage.getItem(key); }catch(e){ return null; }
+  }
+  function writeStore(key, value){
+    try{ localStorage.setItem(key, value); return true; }catch(e){ return false; }
+  }
+
   function loadMutePref(){
-    const stored = localStorage.getItem(MUTE_KEY);
+    const stored = readStore(MUTE_KEY);
     // First-ever load: default muted. After that, respect the user's choice.
     muted = stored === null ? true : stored === "1";
   }
 
   function saveMutePref(){
-    localStorage.setItem(MUTE_KEY, muted ? "1" : "0");
+    writeStore(MUTE_KEY, muted ? "1" : "0");
   }
 
   function getAudioEl(event){
@@ -67,6 +80,14 @@ const AudioHooks = (function(){
     const pattern = HAPTIC_MAP[event];
     if(pattern) { try{ navigator.vibrate(pattern); }catch(e){} }
   }
+
+  /* The persisted preference is read here, at module evaluation, not in init().
+     init() is bound to DOMContentLoaded, but app.js's init IIFE runs
+     synchronously at the end of <body> — before that event — and calls
+     syncMuteBtn() -> isMuted(). So a user who had unmuted saw the header icon
+     render as 🔇 (from the hardcoded default) while `muted` flipped to false a
+     moment later: the icon contradicted the actual state until the next toggle. */
+  loadMutePref();
 
   return {
     init(){

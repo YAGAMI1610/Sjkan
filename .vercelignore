@@ -1,0 +1,16 @@
+# Nothing here belongs in a static deployment.
+#
+# server/ is deliberately excluded: it keeps state in an in-memory Map and runs
+# module-scope setInterval timers, neither of which survives a serverless
+# function's lifecycle. Deploying it as a Vercel function would produce an
+# account that resets between requests — worse than not deploying it at all.
+# With no /api routes present, api-client.js's probe() 404s and the game falls
+# back to its local simulation, which is the intended static behaviour.
+server/
+test/
+node_modules/
+package-lock.json
+QA-NOTES.md
+cli.js
+bin/
+.git/

@@ -1,7 +1,8 @@
 # CADE MEME MADNESS — Simulation Prototype
 
 A prototype of the CADE Meme Madness prediction game. Runs fully client-side
-with no backend; an optional server-authoritative backend is included.
+with no backend; an optional server-authoritative backend and a terminal version
+are included.
 **100% simulated points. No real money, deposits, withdrawals, or wallets.**
 
 ## Run it
@@ -16,13 +17,51 @@ python3 -m http.server 8080
 Served statically it is a complete, playable game — there is nothing to
 configure. The backend below is optional.
 
+## Play it in a terminal
+`cli.js` is the same game at a prompt — zero dependencies, Node builtins only.
+
+```bash
+npm run play                       # or:  node cli.js play
+node cli.js                        # bare invocation plays, on a terminal
+```
+
+Every command also runs non-interactively, which is how the game is scripted or
+scraped:
+
+```bash
+node cli.js claim                              # +20,000 points
+node cli.js session start
+node cli.js round --predict UP --risk 1000     # one round
+node cli.js session end                        # summary + awards
+node cli.js status | records | history | leaderboard | rules
+node cli.js share                              # the share card as text
+```
+
+Useful flags: `--json` (one machine-readable object on stdout and nothing else),
+`--seed N` (deterministic RNG — same seed, same coin and same outcome),
+`--data PATH` or `$CADE_DATA` (which save file to use), `--script` (`play` takes
+its answers from stdin instead of a terminal), `--no-color`.
+Exit codes are `0` success, `1` a refused action (already claimed, not enough
+points), `2` a usage error, `3` an internal one — so `cade claim && cade session
+start` behaves.
+
+Progress lives in `~/.cade-meme-madness.json`, written atomically so an
+interrupt cannot truncate it. `node cli.js reset --yes` erases it.
+
+**The terminal build is not a lookalike.** Every number that decides an outcome
+comes from `rules.js`, the same file the browser loads as a `<script>` and the
+backend `require()`s — so a round scores identically in all three. `npm run
+test:cli` asserts that against `Rules.scoreRound()` round by round.
+
 ## Test it
 ```bash
 npm install            # jsdom, for the UI harness
-npm test               # both suites — 92 checks
-npm run test:ui        # jsdom UI/gameplay smoke test (59 checks)
-npm run test:server    # server contract test (33 checks)
-npm run lint           # node --check over all four JS files
+npm test               # lint + all four suites — 218 checks
+npm run test:ui        # jsdom UI/gameplay smoke test (78 checks)
+npm run test:server    # server contract test (42 checks)
+npm run test:deploy    # Vercel build/deploy test (19 checks)
+npm run test:cli       # CLI production QA (79 checks)
+npm run lint           # node --check over every JS entry point
 ```
 
 `npm run test:server` needs the backend's own deps once:
@@ -30,9 +69,38 @@ npm run lint           # node --check over all four JS files
 
 The UI harness boots the real `index.html` + `app.js` in jsdom with `fetch`
 stubbed to reject, which forces the local-simulation path the static build
-actually uses, and seeds `Math.random` so failures reproduce. See
-[QA-NOTES.md](QA-NOTES.md) for what each suite covers and for the two jsdom
-gotchas to know before editing `test/smoke-test.js`.
+actually uses, and seeds `Math.random` so failures reproduce. The CLI QA spawns
+the real `cli.js` as a child process — argv, exit codes, save file and all — and
+each case gets a throwaway save file, so a QA run can never touch your own.
+See [QA-NOTES.md](QA-NOTES.md) for what each suite covers and for the jsdom and
+readline gotchas to know before editing them.
+
+## Deploy it (Vercel)
+A static deployment: no build step, no serverless functions.
+
+```bash
+npm run test:deploy    # verify before pushing
+vercel --prod          # or connect the repo in the Vercel dashboard
+```
+
+`vercel.json` sets `cleanUrls`, security headers (including a CSP that permits
+the inline handlers and the canvas/`blob:` share card this app genuinely uses),
+and immutable caching for `/assets/*`. There is deliberately **no catch-all
+rewrite**: `api-client.js` decides whether a backend exists by probing
+`/api/health`, and a 404 is the signal to play locally. A rewrite answering
+`/api/*` with `index.html` would turn that into a 200 serving HTML, and every
+call in the app would take the slow failure path forever.
+
+`.vercelignore` keeps `server/`, `test/`, `cli.js` and `node_modules/` out of the
+upload — the Express backend holds state in an in-memory `Map` with a
+module-scope `setInterval`, which is wrong for serverless and would be publicly
+readable as static text besides.
+
+`npm run test:deploy` builds the exact file set Vercel would upload, serves it
+over real HTTP, and fetches all 39 runtime asset paths. It compares them against
+a `readdir` listing rather than `fs.existsSync`, because macOS and Windows are
+case-insensitive and Vercel is not — `assets/coins/Froggo.svg` loads locally and
+404s in production.
 
 ## Optional backend
 `server/server.js` (Express) is a reference implementation of the same rules,
@@ -54,12 +122,23 @@ the UI layer.
 ## Files
 - `index.html` — all screens/markup
 - `style.css` — CADE brand styling (black / cream / purple / yellow / orange, chunky arcade look)
-- `app.js` — full game engine: daily points, boosts, arena gameplay, payout math,
-  session tracking, awards, ceremony, leaderboard, voting, submissions, history, records.
+- `rules.js` — **the single source of truth for the rules**: every tunable
+  number, the coin pools, the weighted outcome table, the award thresholds and
+  the payout maths. Loaded by the browser as a `<script>`, and `require()`d by
+  the CLI and the backend, so the three front ends cannot drift apart. They did
+  once: the backend rolled ±40% price moves against the browser's ±18%, and the
+  same round scored differently depending on whether a backend was reachable.
+- `app.js` — the browser front end: daily points, boosts, arena gameplay,
+  session tracking, awards, ceremony, leaderboard, voting, submissions, history,
+  records. Reads its rules from `rules.js`.
+- `cli.js` — the terminal front end (see above). Reads its rules from `rules.js`.
 - `api-client.js` — server/local fallback layer
 - `audio.js` — sound + haptic hooks (muted by default, respects autoplay rules)
-- `server/server.js` — optional server-authoritative backend
-- `test/` — the two automated suites
+- `server/server.js` — optional server-authoritative backend. Reads its rules
+  from `rules.js`.
+- `vercel.json` / `.vercelignore` — static deployment config
+- `test/` — the four automated suites
+
 
 ## Key mechanics
 - Claim 20,000 points every 24h (`Game.claimDaily`). The "NEXT CLAIM IN" line

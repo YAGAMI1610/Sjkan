@@ -5,28 +5,17 @@
 
 const STORAGE_KEY = "cade_meme_madness_v1";
 
-const CONFIG = {
-  DAILY_POINTS: 20000,
-  DAILY_CLAIM_WINDOW_MS: 24 * 3600 * 1000,
-  ROUND_SECONDS: 25,
-  PAYOUT_MULTIPLIER: 1.8, // default flat multiplier
-  RISK_TIERS: [
-    { min: 0, max: 500, mult: 1.5 },
-    { min: 501, max: 2500, mult: 1.8 },
-    { min: 2501, max: 10000000, mult: 2.0 }
-  ],
-  USE_TIERED_PAYOUT: false, // toggle to true to use RISK_TIERS instead of flat multiplier
-  // §8 — share of rounds that mint a brand-new ticker instead of drawing from
-  // the curated COIN_POOL. 0 = curated only, 1 = always freshly generated.
-  DYNAMIC_COIN_CHANCE: 0.45,
-  QUICK_RISKS: [100, 250, 500, 1000, 2500, 5000, 10000],
-  BOOST_ACTIONS: [
-    { id: "profile", label: "CREATE YOUR CADE PROFILE", reward: 500, icon: "🪪" },
-    { id: "share", label: "SHARE MEME MADNESS", reward: 500, icon: "📣" },
-    { id: "submit", label: "SUBMIT A MEME COIN", reward: 1000, icon: "🧪" },
-    { id: "vote", label: "VOTE IN MEME MADNESS", reward: 500, icon: "🗳️" }
-  ]
-};
+/* The rules — every tunable number, the coin pools, the outcome table, the award
+   thresholds and the payout maths — live in rules.js, which the CLI and the
+   reference backend load too. They are aliased into locals here so the rest of
+   this file reads exactly as it did when the tables were inline.
+
+   Why not keep a copy per front end: the tables were written out three times and
+   drifted twice. The backend was rolling ±40% price moves against the browser's
+   ±18% and weighting FLAT differently, so the same round scored differently
+   depending on whether a backend happened to be reachable. One module makes that
+   impossible instead of merely fixed. */
+const CONFIG = CadeRules.CONFIG;
 
 /* =========================================================
    ASSET MANAGER
@@ -152,65 +141,39 @@ const MemeImage = {
   }
 };
 
-const COIN_POOL = [
-  ["MOONFROG","🐸"],["BONKCAT","🐱"],["GIGAAPE","🦍"],["FROGGO","🐸"],
-  ["MEMEDOG","🐶"],["CHADINU","🐕"],["ROCKETPANDA","🐼"],["WAGMIFROG","🐸"],
-  ["RUGBIRD","🐦"],["PEPEBOSS","🐸"],["DUMBFROG","🐸"],["BANANADOG","🍌"],
-  ["LASERSHARK","🦈"],["TURBOSNAIL","🐌"],["DIAMONDHAMSTER","🐹"],["SADCLOWN","🤡"],
-  ["GIGACHAD","💪"],["MOONPIG","🐷"],["CRYOWL","🦉"],["SPICYTACO","🌮"]
-];
+/* Curated coins (each has hand-drawn SVG art on disk in /assets/coins), plus the
+   parts a dynamically minted ticker is assembled from. Generated coins have no
+   SVG file, so AssetManager falls them back to their emoji — intended, not a
+   missing asset. All from rules.js; see the note above CONFIG. */
+const COIN_POOL = CadeRules.COIN_POOL;
+const COIN_PREFIXES = CadeRules.COIN_PREFIXES;
+const COIN_SUFFIXES = CadeRules.COIN_SUFFIXES;
+const COIN_EMOJI = CadeRules.COIN_EMOJI;
+const SIM_PLAYERS_BASE = CadeRules.SIM_PLAYERS_BASE;
+const OUTCOMES = CadeRules.OUTCOMES;
+const AWARD_DEFS = CadeRules.AWARD_DEFS;
+/* Declared here rather than down in the UTIL block: these replaced hoisted
+   `function` declarations, and a `const` is not hoisted — anything running at
+   module scope above its declaration would hit the temporal dead zone. */
+const rand = CadeRules.rand;
+const randInt = CadeRules.randInt;
+const pick = CadeRules.pick;
 
-// The curated pool above holds the hand-designed coins — each one has real SVG
-// art on disk in /assets/coins. Spec §8 also calls for "many more dynamically",
-// so a share of rounds mint a brand-new ticker from the parts below. Generated
-// coins have no SVG file, so AssetManager falls them back to their emoji, which
-// is the intended behaviour rather than a missing asset.
-const COIN_PREFIXES = ["MOON","GIGA","TURBO","LASER","DIAMOND","CHAD","DEGEN","BASED",
-  "HYPER","MEGA","ULTRA","COSMIC","SPICY","THICC","ZOOM","QUANTUM","ANGRY","SLEEPY",
-  "ROCKET","GALAXY","JUMBO","MICRO","NEON","VELVET"];
-const COIN_SUFFIXES = ["FROG","DOG","CAT","APE","PANDA","SHARK","SNAIL","HAMSTER",
-  "CLOWN","PIG","OWL","BIRD","TACO","BONK","INU","WHALE","GOBLIN","WIZARD","NINJA",
-  "SLOTH","LLAMA","GECKO","MOOSE","TOAD"];
-const COIN_EMOJI = ["🐸","🐶","🐱","🦍","🐼","🦈","🐌","🐹","🤡","🐷","🦉","🐦","🌮",
-  "💪","🚀","🐳","👺","🧙","🥷","🦥","🦙","🦎","🫎","🐊"];
+/* Every award consumer used to index AWARD_DEFS directly and assume s.awards was
+   an array — `s.awards.map(a=>AWARD_DEFS[a].icon)`. Two ways that threw:
 
-const SIM_PLAYERS_BASE = [
-  { name: "PEPE PROPHET", avatar: "🐸" },
-  { name: "CHAD MEME", avatar: "💪" },
-  { name: "MOONBOY", avatar: "🚀" },
-  { name: "FROGGY", avatar: "🐸" },
-  { name: "MEME ORACLE", avatar: "🔮" },
-  { name: "DEGEN DAVE", avatar: "🎲" },
-  { name: "GIGA BRAIN", avatar: "🧠" },
-  { name: "ROCKET RIDER", avatar: "🛸" }
-];
+     1. A session archived by an older build (or returned by /api/history from a
+        server that doesn't compute awards) has no `awards` field at all, so
+        `.map` was called on undefined and the whole History screen rendered
+        blank instead of listing the runs.
+     2. An award code that isn't in AWARD_DEFS — a renamed constant, a session
+        from a newer build read back by an older one — made AWARD_DEFS[code]
+        undefined and `.icon` threw.
 
-// NOTE: `dir` is deliberately NOT stored here — it is derived from the sign of
-// the rolled percentage by MarketEngine.dirFromPct(). Storing both independently
-// let them contradict each other: FLAT used to be hard-coded dir:"DOWN" while
-// rolling a pct anywhere in [-0.5, +0.5], so ~4% of rounds rendered the
-// self-contradictory "TICKER went DOWN (+0.32%)" and lost the round for a player
-// who had correctly predicted UP. Deriving the direction makes that unrepresentable.
-const OUTCOMES = [
-  { key: "STRONG_UP", weight: 10, pct: [8, 18] },
-  { key: "UP", weight: 20, pct: [2, 8] },
-  { key: "SLIGHT_UP", weight: 15, pct: [0.2, 2] },
-  { key: "FLAT", weight: 8, pct: [-0.5, 0.5] },
-  { key: "SLIGHT_DOWN", weight: 15, pct: [-2, -0.2] },
-  { key: "DOWN", weight: 20, pct: [-8, -2] },
-  { key: "STRONG_DOWN", weight: 12, pct: [-18, -8] }
-];
-
-const AWARD_DEFS = {
-  MEME_STAR: { icon: "⭐", title: "MEME STAR", desc: "Exceptional overall performance." },
-  GRINDER: { icon: "🔥", title: "GRINDER", desc: "Played a high number of rounds." },
-  BIGGEST_PAYOUT: { icon: "💰", title: "BIGGEST PAYOUT", desc: "Landed a massive single-round payout." },
-  POINTS_KING: { icon: "🏆", title: "POINTS KING", desc: "Finished with a huge point balance." },
-  PREDICTION_MASTER: { icon: "🎯", title: "PREDICTION MASTER", desc: "Kept a high win rate all session." },
-  HOT_STREAK: { icon: "⚡", title: "HOT STREAK", desc: "Racked up a long winning streak." },
-  MEME_ORACLE: { icon: "🧠", title: "MEME ORACLE", desc: "Consistently correct predictions." },
-  HIGH_ROLLER: { icon: "💎", title: "HIGH ROLLER", desc: "Risked a large amount of points." }
-};
+   Both are recoverable: an unknown code is simply not shown. Everything that
+   displays awards goes through this so the failure mode is a missing chip, not a
+   dead screen. */
+const awardsOf = CadeRules.awardsOf;
 
 /* ---------------- STATE ---------------- */
 function defaultState(){
@@ -256,8 +219,53 @@ function loadState(){
   }catch(e){}
   return defaultState();
 }
+/* saveState is called from inside gameplay (every round resolution, every claim),
+   so it must never throw. Two things made it throw in production:
+
+   1. localStorage is unavailable or write-blocked (Safari private browsing,
+      "block all cookies", storage-disabled embeds). setItem raises there.
+   2. QuotaExceededError. history[] was unbounded and every archived round kept
+      the coin's full 24-point chart array, so a heavy player accumulated
+      megabytes. Once the quota was hit, the throw propagated out of
+      Round.resolve() and the round result overlay never appeared — the game
+      looked frozen mid-round with no way to recover short of clearing storage.
+
+   The fix is a guard plus back-pressure: trim history and retry rather than
+   giving up, and never persist per-round chart data, which is only used to draw
+   the chart during the round it belongs to. */
+const HISTORY_LIMIT = CONFIG.HISTORY_LIMIT;
+
+function safeSetItem(key, value){
+  try{
+    localStorage.setItem(key, value);
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
 function saveState(){
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
+  if(safeSetItem(STORAGE_KEY, JSON.stringify(STATE))) return true;
+  // Over quota (or storage refused the write). Shed the oldest history and the
+  // heaviest field in it, then retry — a couple of times, halving each pass.
+  for(let attempt = 0; attempt < 3; attempt++){
+    if(Array.isArray(STATE.history) && STATE.history.length > 1){
+      STATE.history = STATE.history.slice(0, Math.max(1, Math.floor(STATE.history.length / 2)));
+    } else if(Array.isArray(STATE.history) && STATE.history.length === 1){
+      STATE.history = [];
+    } else {
+      break;
+    }
+    if(safeSetItem(STORAGE_KEY, JSON.stringify(STATE))) return true;
+  }
+  return false; // storage is simply unavailable — keep playing in memory
+}
+
+// A round record only needs the chart while its own round is on screen. Keeping
+// the 24-point array for every round of every session is what filled the quota.
+function trimRoundForStorage(round){
+  if(round && round.coin && round.coin.history) delete round.coin.history;
+  return round;
 }
 
 /* ---------------- UTIL ---------------- */
@@ -270,9 +278,6 @@ function toast(msg){
   $("#toastRoot").appendChild(el);
   setTimeout(()=>el.remove(), 2200);
 }
-function rand(min,max){ return Math.random()*(max-min)+min; }
-function randInt(min,max){ return Math.floor(rand(min,max+1)); }
-function pick(arr){ return arr[randInt(0,arr.length-1)]; }
 function uid(prefix){ return prefix + "_" + Date.now().toString(36) + randInt(100,999); }
 
 /* ---------------- NAV ---------------- */
@@ -293,6 +298,15 @@ const Nav = {
     if(screen === "leaderboard"){
       Leaderboard.refreshFromServer();
       this._lbPoll = setInterval(()=>Leaderboard.refreshFromServer(), 15000);
+    }
+    /* The vote countdown was started by renderVote() and never stopped. It ticks
+       every second, and when the window expires it calls renderVote() again,
+       which starts a fresh one — so after a single visit to the Vote screen the
+       app did a DOM lookup every second for the rest of the tab's life, on every
+       other screen, including mid-round in the arena. */
+    if(screen !== "vote"){
+      clearInterval(UI._voteInterval);
+      UI._voteInterval = null;
     }
     if(screen === "leaderboard") UI.renderLeaderboard();
     if(screen === "vote") UI.renderVote();
@@ -464,7 +478,11 @@ const Game = {
 
     s.awards = Awards.calculate(s);
 
+    // Drop the per-round chart arrays before archiving, and keep history bounded.
+    // Without this, storage grows without limit for as long as someone plays.
+    if(Array.isArray(s.rounds)) s.rounds.forEach(trimRoundForStorage);
     STATE.history.unshift(s);
+    if(STATE.history.length > HISTORY_LIMIT) STATE.history.length = HISTORY_LIMIT;
     Records.update(s);
     STATE.session = null;
     saveState();
@@ -496,17 +514,38 @@ const Game = {
     const ticker = $("#subTicker").value.trim().toUpperCase();
     if(!name || !ticker){ toast("Fill in at least name & ticker!"); return; }
     const meme = { name, ticker, at: Date.now() };
-    const res = await Api.submitMeme(meme, async ()=>{
-      const qualifies = Math.random() < 0.6;
-      STATE.submittedMemes.push(Object.assign({}, meme, { qualifies }));
-      if(!STATE.boosts.submit){ STATE.boosts.submit = true; STATE.balance += CONFIG.BOOST_ACTIONS.find(b=>b.id==="submit").reward; }
-      saveState();
-      return { qualifies, awarded: STATE.boosts.submit ? CONFIG.BOOST_ACTIONS.find(b=>b.id==="submit").reward : 0 };
-    });
-    const qualifies = res.qualifies;
+
+    /* This had no try/catch at all. Api.submitMeme rethrows a 429, so a second
+       submission against a live backend rejected an async function nobody was
+       awaiting — an unhandled rejection, and no feedback whatsoever to the
+       player. And on the success path the server's balance was discarded, so a
+       server-awarded +1,000 never showed up in the header (same class of bug as
+       the one already fixed in claimDaily/doBoost). */
+    let res;
+    try{
+      res = await Api.submitMeme(meme, async ()=>{
+        const qualifies = Math.random() < 0.6;
+        STATE.submittedMemes.push(Object.assign({}, meme, { qualifies }));
+        let awarded = 0;
+        if(!STATE.boosts.submit){
+          STATE.boosts.submit = true;
+          awarded = CONFIG.BOOST_ACTIONS.find(b=>b.id==="submit").reward;
+          STATE.balance += awarded;
+        }
+        saveState();
+        return { qualifies, awarded };
+      });
+    }catch(e){
+      toast("You've already submitted a meme.");
+      return;
+    }
+
+    if(res && typeof res.balance === "number") STATE.balance = res.balance;
+    const qualifies = !!(res && res.qualifies);
     STATE.boosts.submit = true;
     saveState();
     UI.updateHeaderPoints();
+    UI.renderHome();
     if(qualifies){
       UI.showModal({ title: "YOU MADE THE MADNESS! 🏆", body: name + " ($" + ticker + ") has been added to the Meme Madness roster!", confirmLabel: "NICE!", hideCancel:true, onConfirm: ()=>UI.hideModal() });
     } else {
@@ -539,9 +578,14 @@ const Game = {
 const Round = {
   active: false, locked: false, reviewing: false, prediction: null, risk: 0,
   coin: null, outcome: null, timeLeft: CONFIG.ROUND_SECONDS, timerId: null, roundNum: 0,
+  // The session this round was started for. resolve() checks it against the live
+  // session so a round whose session has since ended cannot write into it.
+  session: null,
 
   async begin(){
     const s = STATE.session;
+    if(!s) return; // session was ended before this round could start
+    this.session = s; // remember which session this round belongs to
     this.roundNum = s.rounds.length + 1;
     this.active = true;
     this.locked = false;
@@ -595,12 +639,36 @@ const Round = {
 
   resolve(){
     this.active = false;
+    clearInterval(this.timerId);
     const s = STATE.session;
+
+    /* The player can hit END SESSION or RESTART while a round is still counting
+       down — both buttons sit in the arena header during live play. endSession()
+       sets STATE.session to null, so 25 seconds later this ran `s.rounds.push()`
+       on null and threw a TypeError that took the arena down with it. A round
+       whose session is gone (or has been replaced by a restart) simply has
+       nothing to record: the balance was never debited, so dropping it is the
+       correct outcome, not a silent loss of points. */
+    if(!s || (this.session && this.session !== s)){
+      this.locked = false;
+      this.prediction = null;
+      this.risk = 0;
+      return;
+    }
+
     const hasPrediction = this.locked && this.prediction && this.risk > 0;
+    // A missing or malformed outcome must not silently score every round a loss,
+    // which is what an unexpected server payload used to do: dir came back
+    // undefined, never matched UP or DOWN, and the player lost their stake.
+    const outcome = (this.outcome && typeof this.outcome.pctVal === "number")
+      ? this.outcome
+      : MarketEngine.generateOutcome();
+    outcome.dir = MarketEngine.dirFromPct(outcome.pctVal);
+    this.outcome = outcome;
 
     let result = "SKIPPED", payout = 0, profit = 0, loss = 0;
     if(hasPrediction){
-      const correct = this.prediction === this.outcome.dir;
+      const correct = this.prediction === outcome.dir;
       const mult = MarketEngine.getMultiplier(this.risk);
       if(correct){
         profit = Math.round(this.risk * mult);
@@ -632,9 +700,9 @@ const Round = {
       riskAmount: hasPrediction ? this.risk : 0,
       potentialProfit: hasPrediction ? Math.round(this.risk*MarketEngine.getMultiplier(this.risk)) : 0,
       potentialLoss: hasPrediction ? this.risk : 0,
-      actualOutcome: this.outcome.key,
-      actualDir: this.outcome.dir,
-      pctMove: this.outcome.pctVal,
+      actualOutcome: outcome.key,
+      actualDir: outcome.dir,
+      pctMove: outcome.pctVal,
       result, payout,
       timestamp: Date.now()
     };
@@ -647,7 +715,20 @@ const Round = {
     // #10/#12 — server is the source of truth for the balance delta;
     // local balance already applied above so gameplay never blocks on
     // network latency, this just keeps the account persisted/authoritative.
-    Api.submitRound(s.sessionId, roundRecord, ()=>({ ok:true, balance: STATE.balance }));
+    // The response IS read back now: the server derives the delta itself from
+    // the stake and direction (it no longer trusts the client's signed payout),
+    // so if the two ever disagree the server's number wins rather than the
+    // client drifting away from the persisted account for the rest of the run.
+    Api.submitRound(s.sessionId, roundRecord, ()=>({ ok:true, balance: STATE.balance }))
+      .then(res=>{
+        if(res && typeof res.balance === "number" && res.balance !== STATE.balance){
+          STATE.balance = res.balance;
+          saveState();
+          UI.updateHeaderPoints();
+          UI.updateStatsStrip();
+        }
+      })
+      .catch(()=>{ /* offline / rejected — the local balance stands */ });
 
     if(hasPrediction){
       AudioHooks.play(result === "WIN" ? "roundWin" : "roundLoss");
@@ -666,69 +747,24 @@ const MarketEngine = {
   // §8 — most rounds draw a curated coin (those have hand-drawn SVG art), the
   // rest mint an entirely new ticker so the pool never feels like a fixed list
   // of 20. `isGenerated` lets the UI badge freshly minted coins as NEW.
-  generateCoin(){
-    let ticker, emoji, isGenerated = false;
-    if(Math.random() < CONFIG.DYNAMIC_COIN_CHANCE){
-      ticker = pick(COIN_PREFIXES) + pick(COIN_SUFFIXES);
-      emoji = pick(COIN_EMOJI);
-      isGenerated = !COIN_POOL.some(c => c[0] === ticker);
-    } else {
-      [ticker, emoji] = pick(COIN_POOL);
-    }
-    const price = +(rand(0.0001, 4)).toFixed(6);
-    const move = +(rand(-9,9)).toFixed(2);
-    return { ticker, emoji, price, move, isGenerated, history: this.genHistory(move) };
-  },
-  genHistory(bias){
-    const pts = [];
-    let v = 50;
-    for(let i=0;i<24;i++){
-      v += rand(-6,6) + (bias>0?0.4:-0.4);
-      v = Math.max(5, Math.min(95, v));
-      pts.push(v);
-    }
-    return pts;
-  },
+  generateCoin: CadeRules.generateCoin,
+  genHistory: CadeRules.genHistory,
   // Single source of truth for direction. Any outcome whose rolled percentage is
   // >= 0 is an UP move, anything below is DOWN — so the direction the player is
   // scored against always matches the percentage the UI shows them.
-  dirFromPct(pctVal){ return pctVal >= 0 ? "UP" : "DOWN"; },
-
-  generateOutcome(){
-    const total = OUTCOMES.reduce((a,o)=>a+o.weight,0);
-    let r = rand(0,total);
-    for(const o of OUTCOMES){
-      if(r < o.weight){
-        const pctVal = +(rand(o.pct[0], o.pct[1])).toFixed(2);
-        return Object.assign({}, o, { pctVal, dir: this.dirFromPct(pctVal) });
-      }
-      r -= o.weight;
-    }
-    return Object.assign({}, OUTCOMES[0], { pctVal: 1, dir: "UP" });
-  },
-  getMultiplier(riskAmount){
-    if(!CONFIG.USE_TIERED_PAYOUT) return CONFIG.PAYOUT_MULTIPLIER;
-    const tier = CONFIG.RISK_TIERS.find(t => riskAmount >= t.min && riskAmount <= t.max);
-    return tier ? tier.mult : CONFIG.PAYOUT_MULTIPLIER;
-  }
+  dirFromPct: CadeRules.dirFromPct,
+  generateOutcome: CadeRules.generateOutcome,
+  getMultiplier: CadeRules.getMultiplier,
+  // Result + signed balance delta for a round, the same maths the CLI runs and
+  // the backend re-derives rather than trusting a client-sent payout.
+  scoreRound: CadeRules.scoreRound
 };
 
 /* =========================================================
    AWARDS
    ========================================================= */
 const Awards = {
-  calculate(s){
-    const earned = [];
-    if(s.totalRounds >= 15) earned.push("GRINDER");
-    if(s.largestPayout >= 3000) earned.push("BIGGEST_PAYOUT");
-    if(s.endingBalance >= 40000) earned.push("POINTS_KING");
-    if(s.totalRounds >= 5 && s.winRate >= 65) earned.push("PREDICTION_MASTER");
-    if(s.longestWinStreak >= 4) earned.push("HOT_STREAK");
-    if(s.totalRounds >= 8 && s.winRate >= 75) earned.push("MEME_ORACLE");
-    if(s.totalRisked >= 15000) earned.push("HIGH_ROLLER");
-    if(s.netResult >= 10000 && s.totalRounds >= 10) earned.push("MEME_STAR");
-    return earned;
-  }
+  calculate: CadeRules.calculateAwards
 };
 
 /* =========================================================
@@ -800,7 +836,11 @@ const Leaderboard = {
       streak: STATE.session ? STATE.session.currentStreak : 0,
       winRate: STATE.session && STATE.session.rounds.length ? (STATE.session.wins/STATE.session.rounds.length*100) : (STATE.records.bestWinRate||0)
     };
-    const all = STATE.leaderboard.players.map(p=>({...p, winRate: (p.wins/(p.wins+p.losses||1))*100})).concat([me]);
+    /* `p.wins/(p.wins+p.losses||1)` parses as `p.wins/(p.wins + (p.losses||1))`
+       because || binds looser than +. A 5W/0L player therefore showed 83% (5/6)
+       instead of 100%, and every 0-loss player on the board was under-ranked on
+       the WIN RATE tab. The guard belongs around the whole denominator. */
+    const all = STATE.leaderboard.players.map(p=>({...p, winRate: (p.wins/((p.wins+p.losses)||1))*100})).concat([me]);
     const keyMap = {
       points: p=>p.points,
       payout: p=>p.biggestPayout,
@@ -824,7 +864,7 @@ const ShareCard = {
     text += `${s.totalRounds} rounds\n${Math.round(s.winRate)}% win rate\n${fmt(s.endingBalance)} final points\n${s.netResult>=0?"+":""}${fmt(s.netResult)} net\n`;
     if(s.largestPayout) text += `+${fmt(s.largestPayout)} biggest payout\n`;
     text += `\n`;
-    s.awards.forEach(a=>{ text += `${AWARD_DEFS[a].icon} ${AWARD_DEFS[a].title}\n`; });
+    awardsOf(s).forEach(a=>{ text += `${a.icon} ${a.title}\n`; });
     text += `\nCan you beat my score?`;
     return text;
   }
@@ -884,9 +924,9 @@ const ImageShare = {
     ctx.font = "900 30px Arial";
     ctx.fillText("AWARDS EARNED", 60, awY);
     awY += 20;
-    if(s.awards.length){
-      s.awards.forEach((code,i)=>{
-        const a = AWARD_DEFS[code];
+    const cardAwards = awardsOf(s);
+    if(cardAwards.length){
+      cardAwards.forEach((a,i)=>{
         const x = 60 + (i%2)*((W-160)/2+20);
         const y = awY + 60 + Math.floor(i/2)*70;
         ctx.fillStyle = "#FFD23F";
@@ -931,9 +971,13 @@ const ImageShare = {
         }
       }catch(e){ /* fall through to modal */ }
     }
+    /* `root.innerHTML = ...` wiped whatever was already in #modalRoot, including
+       a confirm modal with a pending onConfirm handler. Appending our own node
+       and removing only that node leaves anything underneath intact. */
     const root = document.getElementById("modalRoot");
-    root.innerHTML = `<div class="modal-overlay">
-      <div class="modal share-img-modal">
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<div class="modal-overlay" id="shareImgOverlay">
+      <div class="modal share-img-modal" role="dialog" aria-modal="true" aria-label="Your result image">
         <h3>YOUR RESULT IMAGE</h3>
         <img src="${dataUrl}" alt="Meme Madness result">
         <div class="actions">
@@ -942,7 +986,20 @@ const ImageShare = {
         </div>
       </div>
     </div>`;
-    document.getElementById("closeShareImg").onclick = ()=>{ root.innerHTML=""; };
+    root.appendChild(wrap);
+
+    const close = ()=>{
+      document.removeEventListener("keydown", onKey);
+      if(wrap.parentNode) wrap.parentNode.removeChild(wrap);
+    };
+    const onKey = (e)=>{ if(e.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey);
+
+    const overlay = wrap.querySelector("#shareImgOverlay");
+    if(overlay) overlay.onclick = (e)=>{ if(e.target === overlay) close(); };
+    const closeBtn = wrap.querySelector("#closeShareImg");
+    closeBtn.onclick = close;
+    if(closeBtn.focus) closeBtn.focus();
   }
 };
 
@@ -950,9 +1007,14 @@ const ImageShare = {
    CEREMONY
    ========================================================= */
 const Ceremony = {
+  _auto: null,
+  _session: null,
+
   run(s){
     const root = $("#ceremonyRoot");
     root.innerHTML = "";
+    clearInterval(this._auto); // never stack two ceremonies' auto-advance timers
+    this._auto = null;
     const overlay = document.createElement("div");
     overlay.className = "ceremony-overlay";
     overlay.innerHTML = `
@@ -986,8 +1048,8 @@ const Ceremony = {
         <div class="ceremony-count">+${fmt(s.largestPayout)}</div>
       </div>`);
     }
-    s.awards.forEach(code=>{
-      const a = AWARD_DEFS[code];
+    awardsOf(s).forEach(a=>{
+      const code = a.code;
       steps.push(`<div class="ceremony-step" data-award="${code}">
         <div class="award-badge award-anim-${code.toLowerCase()}">${AssetManager.slot("award_"+code, AssetManager.paths.award(code), a.icon, "award-art-slot")}</div>
         <div class="award-title">${a.title}</div>
@@ -1035,17 +1097,27 @@ const Ceremony = {
     });
 
     // auto-advance first few steps
-    let auto = setInterval(()=>{
-      if(idx >= stepEls.length-1){ clearInterval(auto); return; }
+    const self = this;
+    this._auto = setInterval(()=>{
+      if(idx >= stepEls.length-1){ clearInterval(self._auto); self._auto = null; return; }
       idx++; showStep(idx);
-      if(idx >= stepEls.length-1) clearInterval(auto);
+      if(idx >= stepEls.length-1){ clearInterval(self._auto); self._auto = null; }
     }, 2200);
 
     showStep(0);
     this._session = s;
   },
+
   finish(){
+    /* Skipping used to leave this interval running: it kept calling showStep()
+       on nodes that had just been removed from the document and, worse, kept
+       firing Confetti.burst() — which appends to document.body — so confetti and
+       award sounds went off every 2.2s over the summary screen until the timer
+       happened to reach the last step. */
+    clearInterval(this._auto);
+    this._auto = null;
     $("#ceremonyRoot").innerHTML = "";
+    if(!this._session) return;
     UI.renderSummary(this._session);
     Nav.go("summary");
   },
@@ -1068,6 +1140,11 @@ const Ceremony = {
 const Confetti = {
   colors: ["#7B3FE4","#FFD23F","#FF7A29","#3FCF6E","#FF4F4F"],
   burst(count=24){
+    /* Every other animation in the app honours prefers-reduced-motion; this one
+       didn't, so the single most motion-heavy effect — 24-30 pieces tumbling down
+       the viewport on every win and every award reveal — kept firing for exactly
+       the users who asked for it to stop. */
+    if(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const root = document.body;
     for(let i=0;i<count;i++){
       const p = document.createElement("div");
@@ -1491,19 +1568,35 @@ const UI = {
   },
   async castVote(i){
     if(STATE.votes.voted){ toast("You already voted this round!"); return; }
+    const coin = STATE.votes.coins[i];
+    if(!coin){ return; } // stale onclick from a re-render
     const roundId = STATE.votes.endsAt; // stable id for this voting round window
     try{
       // #12 — server enforces one vote per round; local fallback mirrors it.
-      await Api.castVote(roundId, STATE.votes.coins[i].ticker, async ()=>{
+      const res = await Api.castVote(roundId, coin.ticker, async ()=>{
         if(STATE.votes.voted){ const err = new Error("Already voted"); err.status = 429; throw err; }
-        return { ok:true };
+        let awarded = 0;
+        if(!STATE.boosts.vote){
+          STATE.boosts.vote = true;
+          awarded = CONFIG.BOOST_ACTIONS.find(b=>b.id==="vote").reward;
+          STATE.balance += awarded;
+        }
+        return { ok:true, awarded };
       });
-      STATE.votes.coins[i].votes++;
+      coin.votes++;
       STATE.votes.voted = true;
-      if(!STATE.boosts.vote){ STATE.boosts.vote = true; STATE.balance += CONFIG.BOOST_ACTIONS.find(b=>b.id==="vote").reward; toast("+500 POINTS — VOTED!"); }
+      /* The boost used to be applied here unconditionally, outside the fallback.
+         Against a live backend that meant the +500 was credited twice — once by
+         the server, once locally — and then overwritten by the next server
+         response, so the points appeared and vanished. The award now happens on
+         exactly one side, and the server's balance wins when it sent one. */
+      if(res && typeof res.balance === "number") STATE.balance = res.balance;
+      if(res && res.awarded > 0) toast(`+${fmt(res.awarded)} POINTS — VOTED!`);
+      STATE.boosts.vote = true;
       saveState();
       UI.updateHeaderPoints();
       this.renderVote();
+      UI.renderHome();
     }catch(e){
       toast("You already voted this round!");
     }
@@ -1531,7 +1624,7 @@ const UI = {
           <div><div class="muted">NET</div><b style="color:${s.netResult>=0?'#3FCF6E':'#FF4F4F'}">${s.netResult>=0?'+':''}${fmt(s.netResult)}</b></div>
           <div><div class="muted">ROUNDS</div><b>${s.totalRounds}</b></div>
           <div><div class="muted">WIN RATE</div><b>${Math.round(s.winRate)}%</b></div>
-          <div><div class="muted">AWARDS</div><b>${s.awards.map(a=>AWARD_DEFS[a].icon).join(" ")||"—"}</b></div>
+          <div><div class="muted">AWARDS</div><b>${awardsOf(s).map(a=>a.icon).join(" ")||"—"}</b></div>
         </div>
         <button class="btn btn-purple btn-block mt12" onclick="UI.viewSession('${s.sessionId}')">VIEW SESSION</button>
       </div>`;
@@ -1577,15 +1670,23 @@ const UI = {
         <div class="box"><div class="v">${s.longestWinStreak}</div><div class="muted">BEST STREAK</div></div>
       </div>
       <div class="award-chip-row">
-        ${s.awards.length ? s.awards.map(a=>`<span class="award-chip">${AWARD_DEFS[a].icon} ${AWARD_DEFS[a].title}</span>`).join("") : '<span class="muted">No awards this run — try again!</span>'}
+        ${awardsOf(s).length ? awardsOf(s).map(a=>`<span class="award-chip">${a.icon} ${a.title}</span>`).join("") : '<span class="muted">No awards this run — try again!</span>'}
       </div>`;
     STATE._lastViewed = s;
   },
 
+  /* Modals were dismissable only by their own CANCEL button. Escape did nothing,
+     tapping the backdrop did nothing, and a hideCancel:true modal (the two
+     "SUBMITTED!" acknowledgements) had exactly one exit. Focus also stayed on
+     whatever button opened the modal, so keyboard and screen-reader users were
+     tabbing around behind the overlay. */
+  _modalEsc: null,
+  _modalReturnFocus: null,
+
   showModal({title, body, confirmLabel, cancelLabel, onConfirm, hideCancel}){
     const root = $("#modalRoot");
-    root.innerHTML = `<div class="modal-overlay">
-      <div class="modal">
+    root.innerHTML = `<div class="modal-overlay" id="modalOverlay">
+      <div class="modal" role="dialog" aria-modal="true" aria-label="${title}">
         <h3>${title}</h3>
         <p class="mt12">${body}</p>
         <div class="actions">
@@ -1594,11 +1695,32 @@ const UI = {
         </div>
       </div>
     </div>`;
-    $("#modalConfirm").onclick = onConfirm;
+    const confirmBtn = $("#modalConfirm");
+    confirmBtn.onclick = onConfirm;
     const cancelBtn = document.getElementById("modalCancel");
     if(cancelBtn) cancelBtn.onclick = ()=>UI.hideModal();
+
+    // Backdrop click — only when the click landed on the overlay itself, not on
+    // the card inside it (which is a descendant and would otherwise bubble).
+    const overlay = document.getElementById("modalOverlay");
+    if(overlay) overlay.onclick = (e)=>{ if(e.target === overlay) UI.hideModal(); };
+
+    this._modalReturnFocus = document.activeElement;
+    this._modalEsc = (e)=>{ if(e.key === "Escape") UI.hideModal(); };
+    document.addEventListener("keydown", this._modalEsc);
+    if(confirmBtn.focus) confirmBtn.focus();
   },
-  hideModal(){ $("#modalRoot").innerHTML = ""; }
+
+  hideModal(){
+    if(this._modalEsc){
+      document.removeEventListener("keydown", this._modalEsc);
+      this._modalEsc = null;
+    }
+    $("#modalRoot").innerHTML = "";
+    const back = this._modalReturnFocus;
+    this._modalReturnFocus = null;
+    if(back && back.focus && document.contains(back)) back.focus();
+  }
 };
 
 /* =========================================================

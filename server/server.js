@@ -25,6 +25,15 @@
 const express = require("express");
 const cors = require("cors");
 
+/* The rules are shared, not mirrored. ../rules.js is the same file index.html
+   loads as a <script> and cli.js require()s, so the outcome table, the payout
+   multiplier and the award thresholds are physically identical across all three
+   front ends. They used to be hand-copied here, and drifted: this server rolled
+   ±40% price moves against the browser's ±18% and weighted FLAT differently, so
+   the game played measurably differently with a backend attached than without
+   one, and any balance the two paths computed for the "same" round diverged. */
+const Rules = require("../rules.js");
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -32,48 +41,33 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
 /* ---------------------------------------------------------
-   CONFIG — mirrors app.js CONFIG so payout math stays identical
+   CONFIG — from rules.js, so payout math is identical by construction
    --------------------------------------------------------- */
-const CONFIG = {
-  DAILY_POINTS: 20000,
-  DAILY_CLAIM_WINDOW_MS: 24 * 3600 * 1000,
-  PAYOUT_MULTIPLIER: 1.8,
-  USE_TIERED_PAYOUT: false,
-  RISK_TIERS: [
-    { min: 0, max: 500, mult: 1.5 },
-    { min: 501, max: 2500, mult: 1.8 },
-    { min: 2501, max: 10000000, mult: 2.0 }
-  ],
-  BOOST_ACTIONS: {
-    profile: 500,
-    share: 500,
-    submit: 1000,
-    vote: 500
-  }
-};
+const CONFIG = Rules.CONFIG;
 
-// Same weighted outcome model as MarketEngine.generateOutcome() client-side.
+// The boost table is an array of {id,label,reward,icon} in rules.js because the
+// browser renders it; this server only ever needs id -> reward.
+const BOOST_REWARDS = Rules.CONFIG.BOOST_ACTIONS.reduce((acc, b) => {
+  acc[b.id] = b.reward;
+  return acc;
+}, {});
+
+/* ---------------------------------------------------------
+   OUTCOMES — the shared table
+   --------------------------------------------------------- */
 // `dir` is NOT stored: it is derived from the sign of the rolled percentage by
 // dirFromPct(), so the direction a round is scored against can never contradict
-// the percentage the client displays. The DOWN rows below previously carried
+// the percentage the client displays. The DOWN rows here previously carried
 // POSITIVE pct ranges ([0.5,4], [4,12], [12,40]) while being labelled DOWN, so
 // every server-generated down-move rendered as "TICKER went DOWN (+7.31%)".
-const OUTCOMES = [
-  { key: "STRONG_UP",   weight: 8,  pct: [12, 40] },
-  { key: "UP",          weight: 20, pct: [4, 12] },
-  { key: "SLIGHT_UP",   weight: 17, pct: [0.5, 4] },
-  { key: "FLAT",        weight: 10, pct: [-0.5, 0.5] },
-  { key: "SLIGHT_DOWN", weight: 17, pct: [-4, -0.5] },
-  { key: "DOWN",        weight: 20, pct: [-12, -4] },
-  { key: "STRONG_DOWN", weight: 8,  pct: [-40, -12] }
-];
+const OUTCOMES = Rules.OUTCOMES;
 
-function rand(min, max){ return Math.random() * (max - min) + min; }
+const rand = Rules.rand;
 
-// Single source of truth for direction, mirroring MarketEngine.dirFromPct().
-// Note the client can only ever predict "UP" or "DOWN", so emitting any third
-// direction (the old dir:"FLAT" row) made 10% of rounds unwinnable by anyone.
-function dirFromPct(pctVal){ return pctVal >= 0 ? "UP" : "DOWN"; }
+// Single source of truth for direction, shared with the client. Note the client
+// can only ever predict "UP" or "DOWN", so emitting any third direction (the old
+// dir:"FLAT" row) made 10% of rounds unwinnable by anyone.
+const dirFromPct = Rules.dirFromPct;
 
 /* ---------------------------------------------------------
    STORE — in-memory reference implementation
@@ -100,6 +94,7 @@ const Store = {
           bestSessionNet: null, bestSessionId: null
         },
         votesByRound: {},      // roundId -> true (one vote per round)
+        roundsSeen: {},        // roundId -> true (replay protection, /round/submit)
         submittedMemes: []
       });
     }
@@ -123,6 +118,9 @@ function ensureLeaderboardSeed(){
 }
 
 // Central tick so every connected client sees the same leaderboard motion (#11).
+// .unref() so the process can exit on its own: without it this handle kept the
+// event loop alive forever, which is why `npm test` hung after the server suite
+// finished and CI had to SIGKILL it.
 setInterval(()=>{
   const players = ensureLeaderboardSeed();
   players.forEach(p=>{
@@ -132,7 +130,7 @@ setInterval(()=>{
       if(delta > 0) p.wins++; else p.losses++;
     }
   });
-}, 15000);
+}, 15000).unref?.();
 
 /* ---------------------------------------------------------
    AUTH MIDDLEWARE — resolves X-Device-Id into an account
@@ -204,7 +202,7 @@ app.post("/api/daily-claim", auth, (req, res) => {
 // #12 — one-time boost actions, enforced server-side.
 app.post("/api/boost", auth, (req, res) => {
   const { id } = req.body || {};
-  const reward = CONFIG.BOOST_ACTIONS[id];
+  const reward = BOOST_REWARDS[id];
   if(!reward) return res.status(400).json({ error: "Unknown boost id" });
   const acct = req.account;
   if(acct.boosts[id]) return res.status(429).json({ error: "Boost already claimed" });
@@ -226,24 +224,66 @@ app.post("/api/round/submit", auth, (req, res) => {
   if(!acct.activeSession || acct.activeSession.sessionId !== sessionId){
     return res.status(400).json({ error: "No matching active session" });
   }
-  // Apply the round's balance delta server-side so balance is authoritative.
-  // `payout` is the client's already-signed delta (+profit on a WIN, -risk on a
-  // LOSS, 0 on a SKIPPED round), so one addition covers every result type.
-  // This previously read `acct.balance += round.profit` — the client's round
-  // record has no `profit` field, so the account balance became NaN on the very
-  // first win and stayed NaN forever (poisoning the leaderboard and records too).
-  const delta = Number(round && round.payout);
-  if(Number.isFinite(delta)) acct.balance += delta;
+  if(!round || typeof round !== "object"){
+    return res.status(400).json({ error: "round required" });
+  }
+
+  /* This used to apply `round.payout` — a signed delta computed and signed by
+     the client — straight onto the balance, with no replay protection. Two
+     concrete consequences:
+
+       1. "Server-authoritative balance" was not authoritative at all. Anything
+          that could POST here could set its own balance by sending
+          {payout: 999999999}: the value was neither derived nor bounded.
+       2. No roundId dedupe, so an ordinary client retry (flaky mobile
+          connection, the request that succeeded but whose response was lost)
+          credited the same win twice.
+
+     The delta is now derived here from the two facts the server can check —
+     the stake and whether the prediction matched the direction — using the
+     server's own multiplier table. A client that lies about the stake can only
+     lie downward against itself, because the stake is also what gets deducted
+     on a loss. */
+  const roundId = String(round.roundId || "");
+  if(!roundId) return res.status(400).json({ error: "round.roundId required" });
+  if(acct.roundsSeen[roundId]){
+    // Idempotent replay: same answer, no second credit.
+    return res.json({ ok: true, balance: acct.balance, duplicate: true });
+  }
+
+  const risk = Math.max(0, Math.floor(Number(round.riskAmount) || 0));
+  /* Scored by the shared rule, so the server's answer and the client's optimistic
+     one agree by construction rather than by two copies of the same arithmetic
+     happening to match. */
+  const scored = Rules.scoreRound(round.prediction, round.actualDir, risk);
+  const result = scored.result;
+  const delta = scored.payout;
+
+  acct.roundsSeen[roundId] = true;
+  acct.balance += delta;
   acct.activeSession.rounds = acct.activeSession.rounds || [];
-  acct.activeSession.rounds.push(round);
-  res.json({ ok: true, balance: acct.balance });
+  acct.activeSession.rounds.push(Object.assign({}, round, { result, payout: delta }));
+  res.json({ ok: true, balance: acct.balance, result, payout: delta });
 });
 
 app.post("/api/session/end", auth, (req, res) => {
   const { session } = req.body || {};
   const acct = req.account;
+  /* With no active session this still ran: Object.assign({}, null, session)
+     happily produced a session object out of whatever the client sent, pushed it
+     onto the history, and — worse — ratcheted every personal record from
+     unvalidated client numbers. Ending a session that was never started is a
+     client bug or an attack; either way it is a 400, not a record update. */
+  if(!acct.activeSession){
+    return res.status(400).json({ error: "No active session" });
+  }
   const s = Object.assign({}, acct.activeSession, session, { endedAt: Date.now() });
   acct.sessions.unshift(s);
+  // Bound the per-account history so a long-lived process can't grow without
+  // limit off one device.
+  if(acct.sessions.length > CONFIG.HISTORY_LIMIT){
+    acct.sessions.length = CONFIG.HISTORY_LIMIT;
+  }
   acct.activeSession = null;
 
   const r = acct.records;
@@ -290,7 +330,7 @@ app.post("/api/meme/submit", auth, (req, res) => {
   let awarded = 0;
   if(!acct.boosts.submit){
     acct.boosts.submit = true;
-    awarded = CONFIG.BOOST_ACTIONS.submit;
+    awarded = BOOST_REWARDS.submit;
     acct.balance += awarded;
   }
   res.json({ ok: true, qualifies, balance: acct.balance, awarded });
@@ -306,7 +346,7 @@ app.post("/api/vote", auth, (req, res) => {
   let awarded = 0;
   if(!acct.boosts.vote){
     acct.boosts.vote = true;
-    awarded = CONFIG.BOOST_ACTIONS.vote;
+    awarded = BOOST_REWARDS.vote;
     acct.balance += awarded;
   }
   res.json({ ok: true, balance: acct.balance, awarded });

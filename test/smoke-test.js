@@ -44,6 +44,21 @@ function check(name, fn) {
 function assert(cond, msg) {
   if (!cond) throw new Error(msg || "assertion failed");
 }
+
+/* check() is deliberately synchronous — a promise returned from its callback
+   would resolve after the report printed, so a failure inside it would surface
+   as an unhandled rejection rather than a recorded failure. Anything that has to
+   await goes through this instead. */
+async function checkAsync(name, fn) {
+  try {
+    const detail = await fn();
+    passed++;
+    console.log("  ✓ " + name + (detail ? "  — " + detail : ""));
+  } catch (err) {
+    failures.push({ name, message: err.message });
+    console.log("  ✗ " + name + "\n      " + err.message);
+  }
+}
 function eq(actual, expected, msg) {
   if (actual !== expected) {
     throw new Error((msg ? msg + ": " : "") +
@@ -57,6 +72,13 @@ const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
 
 const pageErrors = [];
 const consoleErrors = [];
+const unhandled = [];
+
+/* An unhandled rejection is the quietest failure this app can have: an async
+   handler throws, nothing catches it, the user gets no feedback and the console
+   message is easy to miss. Collect them for §16 rather than letting the process
+   print a warning and carry on. */
+process.on("unhandledRejection", r => unhandled.push(String(r && r.message || r)));
 
 const vc = new VirtualConsole();
 vc.on("jsdomError", e => pageErrors.push(e.message));
@@ -78,6 +100,13 @@ const { window } = dom;
    simulation path is the one under test here — the server path is covered
    separately by running server/server.js against these same contracts. */
 window.fetch = () => Promise.reject(new Error("offline (test harness)"));
+/* Every request the page attempts is tallied so §15 can assert the /health probe
+   is issued exactly once per page load however many calls race at boot. */
+const fetchLog = [];
+window.fetch = (url) => {
+  fetchLog.push(String(url));
+  return Promise.reject(new Error("offline (test harness)"));
+};
 window.scrollTo = () => {};
 window.open = () => null;
 window.matchMedia = q => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {} });
@@ -107,10 +136,13 @@ window.__app = {
   get STATE(){ return STATE; },
   CONFIG, Game, Round, UI, Nav, Api, AudioHooks, MarketEngine, MemeImage,
   AssetManager, Ceremony, Records, Awards, ShareCard, Confetti, COIN_POOL,
-  COIN_PREFIXES, COIN_SUFFIXES, OUTCOMES, AWARD_DEFS, saveState, loadState
+  COIN_PREFIXES, COIN_SUFFIXES, OUTCOMES, AWARD_DEFS, saveState, loadState,
+  Leaderboard, awardsOf, trimRoundForStorage, HISTORY_LIMIT, CadeRules
 };`;
+/* rules.js first, in the same order index.html loads them: it defines the
+   CadeRules global that app.js aliases at module scope. */
 window.eval(
-  ["api-client.js", "audio.js", "app.js"]
+  ["rules.js", "api-client.js", "audio.js", "app.js"]
     .map(s => fs.readFileSync(path.join(ROOT, s), "utf8"))
     .join("\n;\n") + "\n;\n" + BRIDGE
 );
@@ -578,7 +610,284 @@ async function playRound(dir, stake) {
       "no grid-template-columns for .arena-cols inside a min-width:900px query");
   });
 
-  group("14. Nothing accumulated errors during the whole run");
+  group("15. Bug-sweep regressions (each of these used to break the app)");
+
+  check("resolving a round whose session was ended does not throw", () => {
+    // The player can hit END SESSION mid-round; 25s later resolve() ran
+    // s.rounds.push() on null and took the arena down with a TypeError.
+    const before = app.STATE.balance;
+    app.Round.active = true;
+    app.Round.locked = true;
+    app.Round.prediction = "UP";
+    app.Round.risk = 1000;
+    app.Round.session = { sessionId: "sess_gone", rounds: [] };
+    app.Round.coin = { ticker: "TEST", emoji: "🧪", name: "Test", history: [1, 2, 3] };
+    app.Round.outcome = null;
+    app.STATE.session = null;
+    app.Round.resolve();                       // must not throw
+    eq(app.STATE.balance, before, "a dropped round moved the balance");
+    eq(app.Round.locked, false, "resolve left the round locked");
+    eq(app.Round.prediction, null, "resolve left a stale prediction");
+  });
+
+  check("a round belonging to a replaced session is dropped, not misfiled", () => {
+    const live = { sessionId: "sess_new", rounds: [], wins: 0, losses: 0 };
+    app.STATE.session = live;
+    app.Round.active = true;
+    app.Round.locked = true;
+    app.Round.prediction = "UP";
+    app.Round.risk = 500;
+    app.Round.session = { sessionId: "sess_old", rounds: [] };  // pre-restart session
+    app.Round.coin = { ticker: "TEST", emoji: "🧪", name: "Test", history: [1] };
+    app.Round.resolve();
+    eq(live.rounds.length, 0, "the old round was written into the new session");
+    app.STATE.session = null;
+  });
+
+  /* jsdom's Storage is proxy-backed: assigning `localStorage.setItem = fn` stores
+     an item literally called "setItem" and leaves the real method in place. The
+     whole object has to be swapped to intercept a write. */
+  function withStorage(stub, fn) {
+    const real = window.localStorage;
+    try {
+      Object.defineProperty(window, "localStorage", { value: stub, configurable: true });
+      return fn(real);
+    } finally {
+      Object.defineProperty(window, "localStorage", { value: real, configurable: true });
+    }
+  }
+
+  check("saveState survives storage that refuses every write", () => {
+    let threw = null, result = null;
+    withStorage({
+      getItem: () => null,
+      setItem: () => { throw new Error("QuotaExceededError"); },
+      removeItem: () => {}
+    }, () => {
+      try { result = app.saveState(); } catch (e) { threw = e.message; }
+    });
+    assert(!threw, "saveState propagated: " + threw);
+    eq(result, false, "saveState claimed success with storage refusing writes");
+  });
+
+  check("saveState sheds history to get under quota rather than giving up", () => {
+    const realHistory = app.STATE.history;
+    app.STATE.history = Array.from({ length: 40 }, (_, i) => ({ sessionId: "s" + i, awards: [], rounds: [] }));
+    let calls = 0;
+    const ok = withStorage({
+      getItem: () => null,
+      setItem() { if (++calls < 3) throw new Error("QuotaExceededError"); },  // succeeds on the 3rd try
+      removeItem: () => {}
+    }, () => app.saveState());
+    const len = app.STATE.history.length;
+    app.STATE.history = realHistory;
+    app.saveState();
+    eq(ok, true, "saveState gave up instead of trimming");
+    assert(len < 40, "history was not trimmed (still " + len + ")");
+    return "trimmed 40 -> " + len + " over " + calls + " attempts";
+  });
+
+  check("archived rounds carry no chart data and history stays capped", () => {
+    const realHistory = app.STATE.history;
+    app.STATE.history = Array.from({ length: app.HISTORY_LIMIT + 5 }, (_, i) => ({ sessionId: "old" + i, awards: [] }));
+    app.STATE.session = {
+      sessionId: "sess_trim", startedAt: Date.now(), startingBalance: app.STATE.balance,
+      rounds: [{ roundId: "r1", coin: { ticker: "T", history: [1, 2, 3] }, result: "WIN", payout: 100, riskAmount: 50 }],
+      wins: 1, losses: 0, skipped: 0, currentStreak: 1, longestWinStreak: 1,
+      totalRisked: 50, totalProfit: 100, totalLoss: 0, largestPayout: 100, largestLoss: 0
+    };
+    app.Game.endSession();
+    const archived = app.STATE.history[0];
+    const len = app.STATE.history.length;
+    const hasChart = !!(archived.rounds && archived.rounds[0].coin && archived.rounds[0].coin.history);
+    app.STATE.history = realHistory;
+    app.saveState();
+    assert(!hasChart, "the 24-point chart array was persisted with the round");
+    assert(len <= app.HISTORY_LIMIT, "history grew past the cap: " + len);
+    return "capped at " + len;
+  });
+
+  check("skipping the ceremony stops its auto-advance timer", () => {
+    const s = {
+      sessionId: "sess_cer", startedAt: Date.now(), endedAt: Date.now(),
+      startingBalance: 20000, endingBalance: 21800, netResult: 1800,
+      totalRounds: 1, wins: 1, losses: 0, skipped: 0, winRate: 100,
+      totalRisked: 1000, largestPayout: 1800, largestLoss: 0, longestWinStreak: 1,
+      awards: ["MEME_STAR"], rounds: []
+    };
+    app.Ceremony.run(s);
+    assert(app.Ceremony._auto !== null, "the ceremony never armed its timer");
+    app.Ceremony.finish();
+    eq(app.Ceremony._auto, null, "finish() left the interval running — confetti keeps firing");
+  });
+
+  check("a 0-loss player's win rate is 100%, not 83%", () => {
+    // p.wins/(p.wins+p.losses||1) parses as p.wins/(p.wins+(p.losses||1)).
+    app.Leaderboard.ensure();
+    const real = app.STATE.leaderboard.players;
+    app.STATE.leaderboard.players = [{ name: "perfect", avatar: "🧪", points: 1, wins: 5, losses: 0, biggestPayout: 0, streak: 5 }];
+    const row = app.Leaderboard.getRanked("winrate").find(p => p.name === "perfect");
+    app.STATE.leaderboard.players = real;
+    eq(Math.round(row.winRate), 100, "win rate is still mis-parenthesised");
+  });
+
+  check("leaving the vote screen stops the 1s countdown interval", () => {
+    app.Nav.go("vote");
+    assert(app.UI._voteInterval, "renderVote never started the countdown");
+    app.Nav.go("home");
+    eq(app.UI._voteInterval, null, "the countdown kept ticking on another screen");
+  });
+
+  check("a session with no awards field renders instead of throwing", () => {
+    // Sessions archived by an older build have no `awards`; History used to go blank.
+    const realHistory = app.STATE.history;
+    app.STATE.history = [{
+      sessionId: "legacy_1", startedAt: Date.now(), endedAt: Date.now(),
+      startingBalance: 20000, endingBalance: 20500, netResult: 500,
+      totalRounds: 2, wins: 1, losses: 1, skipped: 0, winRate: 50,
+      largestPayout: 900, rounds: []
+      // no awards key at all
+    }];
+    let threw = null;
+    try { app.UI.renderHistory(); } catch (e) { threw = e.message; }
+    const txt = $("#historyList").textContent;
+    app.STATE.history = realHistory;
+    app.UI.renderHistory();
+    assert(!threw, "renderHistory threw: " + threw);
+    assert(/legacy_1|500/.test(txt), "the legacy session did not render");
+  });
+
+  check("an unrecognised award code is skipped, not fatal", () => {
+    const s = { awards: ["MEME_STAR", "NOT_A_REAL_AWARD", "HOT_STREAK"] };
+    const list = app.awardsOf(s);
+    eq(list.length, 2, "unknown codes were not filtered");
+    assert(list.every(a => a.icon && a.title), "a resolved award is missing fields");
+    eq(app.awardsOf({}).length, 0, "a session with no awards did not yield []");
+    eq(app.awardsOf(null).length, 0, "a null session did not yield []");
+  });
+
+  check("ShareCard text survives a session with a bad award code", () => {
+    const txt = app.ShareCard.buildText({
+      totalRounds: 3, winRate: 66.6, endingBalance: 21000, netResult: 1000,
+      largestPayout: 900, awards: ["BOGUS_CODE"]
+    });
+    assert(!/undefined/.test(txt), txt.slice(0, 120));
+  });
+
+  check("Escape closes a modal and the backdrop click does too", () => {
+    app.UI.showModal({ title: "T", body: "B", confirmLabel: "OK", hideCancel: true, onConfirm: () => app.UI.hideModal() });
+    assert($("#modalRoot").textContent.includes("B"), "the modal did not open");
+    const esc = new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true });
+    doc.dispatchEvent(esc);
+    eq($("#modalRoot").innerHTML, "", "Escape did not dismiss the modal");
+
+    app.UI.showModal({ title: "T2", body: "B2", confirmLabel: "OK", hideCancel: true, onConfirm: () => app.UI.hideModal() });
+    const overlay = $("#modalOverlay");
+    assert(overlay, "no #modalOverlay to click");
+    overlay.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    eq($("#modalRoot").innerHTML, "", "a backdrop click did not dismiss the modal");
+  });
+
+  check("clicking inside the modal card does NOT dismiss it", () => {
+    app.UI.showModal({ title: "T3", body: "B3", confirmLabel: "OK", hideCancel: true, onConfirm: () => {} });
+    const card = $("#modalRoot .modal");
+    card.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    assert($("#modalRoot").textContent.includes("B3"), "a click on the card itself closed the modal");
+    app.UI.hideModal();
+  });
+
+  check("confetti is suppressed under prefers-reduced-motion", () => {
+    const realMM = window.matchMedia;
+    window.matchMedia = q => ({ matches: /reduce/.test(q), media: q, addEventListener() {}, removeEventListener() {} });
+    const before = doc.querySelectorAll(".confetti-piece").length;
+    app.Confetti.burst(10);
+    const after = doc.querySelectorAll(".confetti-piece").length;
+    window.matchMedia = realMM;
+    eq(after, before, "confetti still rendered with reduced motion requested");
+  });
+
+  check("the /health probe is issued exactly once per page load", () => {
+    const probes = fetchLog.filter(u => /\/health$/.test(u));
+    eq(probes.length, 1, "fired " + probes.length + " probes: concurrent callers each ran their own");
+    return fetchLog.length + " requests total, 1 probe";
+  });
+
+  await checkAsync("the vote boost is credited exactly once", async () => {
+    app.STATE.boosts.vote = false;
+    app.STATE.votes = { endsAt: Date.now() + 60000, coins: [{ ticker: "AAA", emoji: "🅰️", votes: 10 }], voted: false };
+    const before = app.STATE.balance;
+    await app.UI.castVote(0);
+    await tick(5);
+    const reward = app.CONFIG.BOOST_ACTIONS.find(b => b.id === "vote").reward;
+    eq(app.STATE.balance - before, reward, "the vote boost was double- or non-credited");
+    eq(app.STATE.votes.voted, true, "the vote was not recorded");
+    return "+" + reward + " once";
+  });
+
+  await checkAsync("a rejected meme submission is caught and surfaced to the player", async () => {
+    const realFn = app.Api.submitMeme;
+    app.Api.submitMeme = () => { const e = new Error("Boost already claimed"); e.status = 429; return Promise.reject(e); };
+    $("#subName").value = "Rejected Frog";
+    $("#subTicker").value = "REJFROG";
+    try {
+      await app.Game.submitMeme();
+      await tick(10);
+    } finally {
+      app.Api.submitMeme = realFn;
+    }
+    assert(unhandled.length === 0, "unhandled rejection: " + unhandled.join(", "));
+    const toastTxt = $("#toastRoot").textContent;
+    assert(/already submitted/i.test(toastTxt), "no feedback shown, toast said: " + toastTxt.slice(0, 80));
+  });
+
+  check("the persisted mute preference is honoured before DOMContentLoaded", () => {
+    /* AudioHooks.init() is bound to DOMContentLoaded, but app.js's init IIFE runs
+       synchronously at the end of <body> and reads isMuted() to draw the header
+       icon. Re-evaluating audio.js in its own scope (DOMContentLoaded long since
+       fired here) reproduces exactly that window. */
+    const src = fs.readFileSync(path.join(ROOT, "audio.js"), "utf8");
+    const probe = stored => {
+      if (stored === null) window.localStorage.removeItem("cade_mm_muted");
+      else window.localStorage.setItem("cade_mm_muted", stored);
+      window.eval(src + "\n;window.__audioProbe = AudioHooks;");
+      return window.__audioProbe.isMuted();
+    };
+    const unmuted = probe("0");
+    const muted = probe("1");
+    const fresh = probe(null);
+    eq(unmuted, false, "a stored 'unmuted' preference was ignored at load");
+    eq(muted, true, "a stored 'muted' preference was ignored at load");
+    eq(fresh, true, "a first-ever load should default to muted");
+  });
+
+  check("api-client and audio still define their globals when storage throws", () => {
+    /* Safari private browsing / \"block all cookies\": localStorage.getItem throws.
+       Unguarded, that threw during module evaluation, so `Api` and `AudioHooks`
+       were never defined and every call site became a ReferenceError. */
+    const realLS = window.localStorage;
+    const throwing = {
+      getItem() { throw new Error("SecurityError: storage disabled"); },
+      setItem() { throw new Error("SecurityError: storage disabled"); },
+      removeItem() { throw new Error("SecurityError: storage disabled"); }
+    };
+    let threw = null, apiOk = false, audioOk = false;
+    try {
+      Object.defineProperty(window, "localStorage", { value: throwing, configurable: true });
+      window.eval(fs.readFileSync(path.join(ROOT, "api-client.js"), "utf8") + "\n;window.__apiProbe = Api;");
+      apiOk = !!(window.__apiProbe && typeof window.__apiProbe.deviceId === "string");
+      window.eval(fs.readFileSync(path.join(ROOT, "audio.js"), "utf8") + "\n;window.__audioProbe2 = AudioHooks;");
+      audioOk = !!(window.__audioProbe2 && typeof window.__audioProbe2.isMuted() === "boolean");
+    } catch (e) {
+      threw = e.message;
+    } finally {
+      Object.defineProperty(window, "localStorage", { value: realLS, configurable: true });
+    }
+    assert(!threw, "module evaluation threw with storage disabled: " + threw);
+    assert(apiOk, "Api was not defined / has no deviceId when storage throws");
+    assert(audioOk, "AudioHooks was not defined when storage throws");
+  });
+
+  group("16. Nothing accumulated errors during the whole run");
   check("no jsdomError at any point", () => {
     assert(pageErrors.length === 0, pageErrors.slice(0, 3).join("\n      "));
   });

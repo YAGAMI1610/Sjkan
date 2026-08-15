@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="CADE Meme Madness">
+  <rect width="64" height="64" rx="14" fill="#111111"/>
+  <rect x="5" y="5" width="54" height="54" rx="11" fill="#7B3FE4"/>
+  <!-- arcade up-arrow: the one gesture the whole game is built on -->
+  <path d="M32 15 L49 38 H38 V50 H26 V38 H15 Z" fill="#FFD23F" stroke="#111111" stroke-width="3.5"
+        stroke-linejoin="round"/>
+</svg>

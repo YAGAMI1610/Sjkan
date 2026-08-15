@@ -3,11 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "description": "CADE Meme Madness — simulated meme-coin prediction arcade. 100% fictional, no real money.",
+  "bin": {
+    "cade": "./cli.js"
+  },
   "scripts": {
-    "test": "node test/smoke-test.js && node test/server-test.js",
+    "test": "npm run lint && node test/smoke-test.js && node test/server-test.js && node test/deploy-test.js && node test/cli-test.js",
     "test:ui": "node test/smoke-test.js",
     "test:server": "node test/server-test.js",
-    "lint": "node --check app.js && node --check api-client.js && node --check audio.js && node --check server/server.js",
+    "test:deploy": "node test/deploy-test.js",
+    "test:cli": "node test/cli-test.js",
+    "lint": "node --check rules.js && node --check app.js && node --check api-client.js && node --check audio.js && node --check cli.js && node --check server/server.js",
+    "play": "node cli.js play",
     "serve": "node -e \"const h=require('http'),f=require('fs'),p=require('path');const T={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.jpg':'image/jpeg','.png':'image/png'};h.createServer((q,s)=>{const u=q.url.split('?')[0];const fp=p.join(__dirname,u==='/'?'index.html':u);f.readFile(fp,(e,d)=>{if(e){s.writeHead(404).end('404');return}s.writeHead(200,{'Content-Type':T[p.extname(fp)]||'application/octet-stream'}).end(d)})}).listen(8080,()=>console.log('http://localhost:8080'))\"",
     "server": "npm --prefix server start"
   },

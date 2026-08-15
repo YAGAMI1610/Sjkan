@@ -193,11 +193,12 @@ bare line of grey text; and a `prefers-reduced-motion` block that disables the
 lot. Nothing added is load-bearing — every animation degrades to a static
 state.
 
-## Automated test suite (new)
-`npm test` runs two harnesses — **92 checks, 0 failures** — and `npm run lint`
-runs `node --check` over all four JS files.
+## Automated test suite
+`npm test` runs `npm run lint` plus four harnesses — **218 checks, 0 failures**.
+Lint is `node --check` over `rules.js`, `app.js`, `api-client.js`, `audio.js`,
+`cli.js` and `server/server.js`.
 
-**`test/smoke-test.js`** (59 checks) boots the real `index.html` + `app.js` in
+**`test/smoke-test.js`** (78 checks) boots the real `index.html` + `app.js` in
 jsdom with `fetch` stubbed to reject, which is what forces the local
 simulation path the static build actually uses. `Math.random` is a seeded LCG,
 so a failure reproduces. It covers: boot with no unhandled errors; a
@@ -211,15 +212,19 @@ asserting the distribution is near-fair (P(UP) ≈ 49.2%); the balance math; a
 12-round session end-to-end; the ceremony and all four §44 exits; records;
 every other screen; and persistence across a reload.
 
-One jsdom detail worth knowing before editing this file: a top-level `const` in
-a browser lands in the global *lexical* scope, not on `window`, so it is
+Three jsdom details worth knowing before editing this file. A top-level `const`
+in a browser lands in the global *lexical* scope, not on `window`, so it is
 reachable from inline `onclick=` handlers but never as `window.X`. jsdom also
 scopes each `window.eval()` call separately. Both are why the harness
-concatenates all three scripts into a **single** eval and appends a `BRIDGE`
-epilogue that hangs the internals on `window.__app`. Splitting that eval, or
-reaching for `window.Game`, will fail with `ReferenceError`.
+concatenates all four scripts into a **single** eval — `rules.js` first, in the
+same order `index.html` loads them — and appends a `BRIDGE` epilogue that hangs
+the internals on `window.__app`. Splitting that eval, or reaching for
+`window.Game`, will fail with `ReferenceError`. And jsdom's `Storage` is
+proxy-backed, so `localStorage.setItem = fn` stores an *item named "setItem"*
+rather than replacing the method; the whole object has to be swapped via
+`Object.defineProperty`, which is what `withStorage()` does.
 
-**`test/server-test.js`** (33 checks) boots `server/server.js` on an ephemeral
+**`test/server-test.js`** (42 checks) boots `server/server.js` on an ephemeral
 port and exercises every endpoint the client calls. This is the half of the
 build where the damaging bugs lived, precisely because they're unreachable from
 the static app: the client falls back to local simulation, so a broken server
@@ -227,9 +232,127 @@ looks like a working game right up until the backend is deployed. It pins the
 `round.profit` NaN bug (a field the client never sends, which turned the
 balance into `NaN` on the first win — permanently, and poisoned the leaderboard
 and records with it), the DOWN-with-a-positive-percentage rows, the `dir:"FLAT"`
-row the client can never match, and `bestSessionNet: -Infinity`. It also
-asserts the client and server agree on `PAYOUT_MULTIPLIER` and `DAILY_POINTS`,
-so the two halves can't drift apart silently.
+row the client can never match, and `bestSessionNet: -Infinity`. Group 9 now
+guards the shared-rules architecture instead of text-diffing two copies of the
+same table: it fails the build if a second copy of `OUTCOMES`, `COIN_POOL`,
+`AWARD_DEFS` or `SIM_PLAYERS_BASE` reappears in `app.js` or `server/server.js`,
+if either file hard-codes `PAYOUT_MULTIPLIER`/`DAILY_POINTS`/
+`DYNAMIC_COIN_CHANCE`, or if `index.html` ever loads `rules.js` *after* `app.js`
+(which would leave `CadeRules` undefined at alias time). Two live HTTP checks
+then prove the running server pays exactly `Rules.scoreRound()` on a win and on
+a loss.
+
+Note when running the backend by hand: `express` is installed in
+`server/node_modules`, so the process has to be started from `server/`.
+`node server/server.js` from the repo root cannot resolve express and exits
+immediately — which looks like `ECONNREFUSED` from whatever is calling it.
+
+**`test/deploy-test.js`** (19 checks) answers one question: if this commit is
+pushed to Vercel, does the deployed site work? It reconstructs the exact file
+set Vercel would upload (honouring `.vercelignore`), serves it over real HTTP,
+and requests every URL the app references — all 39 runtime asset paths included.
+The asset check compares against a `readdir` listing rather than
+`fs.existsSync`, because macOS and Windows are case-insensitive and Vercel's
+filesystem is not: `assets/coins/Froggo.svg` loads locally and 404s in
+production, and `existsSync` cannot see the difference. It also asserts
+`/api/health` 404s (a catch-all rewrite would answer it with 200 HTML,
+`api-client.js` would read that as "a backend exists", and every call in the app
+would take the slow failure path forever), that `server/`, `test/` and
+`node_modules/` are absent from the upload, and that no `gh*_`/`github_pat_`
+credential is embedded in any deployable file.
+
+**`test/cli-test.js`** (79 checks) is the production QA for the terminal build.
+It spawns the real `cli.js` as a child process rather than requiring it, because
+what breaks a CLI in production is not internal: it's argv parsing, exit codes,
+the save file, a stray colour escape in piped output. Each case gets a
+throwaway save file under a temp directory, so a QA run cannot touch a real
+`~/.cade-meme-madness.json` and cases cannot contaminate each other.
+
+The load-bearing groups:
+
+- **Parity** — 24 rounds asserting every payout equals `Rules.scoreRound()`
+  exactly, plus a win at the configured multiplier, a loss at exactly the stake,
+  `SKIPPED` costing nothing, direction always matching the sign of the move, and
+  the same `--seed` producing the same coin and outcome twice over.
+- **Ledger integrity** — across a whole session, `sum(payouts)` must equal
+  `endingBalance - startingBalance`, and `wins + losses + skips` must equal
+  `totalRounds`. Any double-credit or missed debit shows up as one failed
+  subtraction. Also: an over-stake is refused rather than clamped, and the
+  balance can never go negative even on a 40-round all-in loop.
+- **Exit codes** — `0`/`1`/`2`/`3`, so `cade claim && cade session start` works.
+- **Pipe hygiene** — no ANSI escapes in captured stdout, errors on stderr, and
+  `--json` printing exactly one parseable object and nothing else.
+- **Save file durability** — atomic write leaves no temp files, mode is `0600`,
+  a corrupt file is reported rather than silently reset (overwriting it would
+  destroy data that might be recoverable), an older schema is backfilled rather
+  than read as `undefined`, and state survives the process boundary.
+- **Drift guard** — the same structural check as the server's group 9, applied to
+  `cli.js`, plus an assertion that `cli.js` is in `.vercelignore`.
+
+### CLI bugs found and fixed by this QA pass
+1. **`--seed banana` exited 1, not 2.** Seed validation ran above the `const C`
+   colour table, so `fail()` hit the temporal dead zone reaching for `C.red`; a
+   usage error surfaced as a `ReferenceError`. Seed handling moved below the
+   output helpers, where `fail()` is safe to call — still ahead of `loadState()`
+   and every command, which is all `Math.random` interception needs.
+2. **A bad flag reported the wrong problem.** `round --predict SIDEWAYS` checked
+   the session before the flags, so a typo with no session open reported "no
+   session" and exited 1. A script cannot tell a typo from a state problem if
+   both collapse to the same code. Flags are now validated first.
+3. **Interactive play quit itself after one answer.** Each prompt created its own
+   readline interface and closed it when it settled. readline reads stdin
+   greedily — by the time it hands you the first line it has buffered whatever
+   else arrived — so closing it discarded that buffer, the next interface opened
+   on an exhausted stdin, and every later prompt resolved as "closed".
+4. **...and then dropped input between prompts.** A single shared interface with
+   a listener attached per prompt loses lines that arrive while no prompt is
+   open — during the moment spent rendering a result card, or when input comes in
+   faster than the prompts appear. Lines are now always consumed into a queue,
+   and `ask()` checks that queue before it waits. Typing ahead is answered in
+   order instead of vanishing.
+5. **Declining the lock was reported as a timeout.** Answering `n` at the review
+   step resolved the round `SKIPPED` and printed "the clock ran out", which was
+   simply false. The round is now a decision loop: a typo or a declined lock
+   returns you to the direction prompt for the *same* coin, matching the app's
+   `cancelReview()`. Only the clock expiring resolves a round without a
+   prediction, so that message is always literally true.
+6. **An expired prompt printed itself twice.** The timeout handler sent Ctrl-U to
+   erase half-typed input, and readline's redraw reprinted the prompt it still
+   held. It now clears the prompt before the redraw, then wipes the line.
+
+Bugs 3–6 are only reachable through a terminal, which no portable test can
+allocate. They were found by driving `cli.js` under a pty (`script -qec`), and
+they are now regression-covered through `--script`, a documented mode in which
+`play` reads its answers from stdin — the same code path, minus the TTY
+requirement. The one thing still verified by hand rather than in the suite is the
+25-second clock actually expiring, since asserting it costs 25s of wall clock;
+that was confirmed under a pty, resolving `SKIPPED` with nothing staked.
+
+## The rules live in one file now
+The three front ends — browser, CLI, backend — used to each hold their own copy
+of the rules, and the copies drifted twice. The backend rolled ±40% price moves
+against the browser's ±18% and weighted `FLAT` differently, so the same round
+scored differently depending on whether a backend happened to be reachable.
+
+`rules.js` is now the only place any of it exists: `CONFIG`, the coin pools, the
+weighted `OUTCOMES` table, `AWARD_DEFS`, the sim players, and the payout maths in
+`scoreRound()`. It uses a UMD wrapper —
+
+```js
+if (typeof module === "object" && module.exports) module.exports = factory();
+else root.CadeRules = factory();
+```
+
+— deliberately, rather than an ES export: the browser build has no bundler and
+loads its scripts as plain `<script src>`, so an `export` would force a build
+step onto a project that currently needs none.
+
+One hazard to know when editing `app.js`: the aliases (`const rand =
+CadeRules.rand`, etc.) replaced hoisted `function` declarations, and a `const` is
+**not** hoisted. Anything running at module scope above the alias — `let STATE =
+loadState();` at `app.js:199` — would hit the temporal dead zone. That is why the
+alias block sits at the top of the file rather than down in the UTIL section, and
+why `uid()` is still a `function` declaration.
 
 ## Summary
 Items 14 and 15 are addressed in code with the specific diffs listed above,
@@ -240,3 +363,4 @@ rather than an open-ended one. The screen-reader pass on the dynamically
 injected overlays (noted under item 14) is likewise still open — the automated
 suite asserts those overlays open, populate and close correctly, but it can't
 speak to how they're announced.
+

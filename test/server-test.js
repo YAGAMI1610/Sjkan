@@ -166,37 +166,72 @@ function api(method, route, body, deviceId) {
     const start = await api("POST", "/session/start", { session: { sessionId, rounds: [] } }, D);
     check("session/start accepts the client's session", () => eq(start.status, 200));
 
-    // The client's round record: `payout` is the signed delta. There is no
-    // `profit` field — the server used to add exactly that, hence NaN.
+    /* The client's round record carries prediction + actualDir + riskAmount. The
+       server derives the delta from those three itself; it deliberately does NOT
+       use the client's `payout`, which is why the payloads below send a hostile
+       one and still expect the correct balance. */
     const win = await api("POST", "/round/submit", {
-      sessionId, round: { roundId: "r1", result: "WIN", riskAmount: 1000, payout: 1800 }
+      sessionId, round: { roundId: "r1", prediction: "UP", actualDir: "UP", riskAmount: 1000, result: "WIN", payout: 1800 }
     }, D);
     check("a WIN credits +1,800 on a 1,000 stake (risk × 1.8, §11)", () => {
       eq(win.status, 200);
       eq(win.body.balance, 21800);
+      eq(win.body.result, "WIN");
       assert(win.body.balance === win.body.balance, "balance is NaN");
     });
 
     const loss = await api("POST", "/round/submit", {
-      sessionId, round: { roundId: "r2", result: "LOSS", riskAmount: 500, payout: -500 }
+      sessionId, round: { roundId: "r2", prediction: "UP", actualDir: "DOWN", riskAmount: 500, result: "LOSS", payout: -500 }
     }, D);
-    check("a LOSS debits the stake", () => eq(loss.body.balance, 21300));
+    check("a LOSS debits the stake", () => {
+      eq(loss.body.balance, 21300);
+      eq(loss.body.result, "LOSS");
+    });
 
     const skip = await api("POST", "/round/submit", {
-      sessionId, round: { roundId: "r3", result: "SKIPPED", riskAmount: 0, payout: 0 }
+      sessionId, round: { roundId: "r3", prediction: null, actualDir: "UP", riskAmount: 0, result: "SKIPPED", payout: 0 }
     }, D);
-    check("a SKIPPED round moves nothing", () => eq(skip.body.balance, 21300));
+    check("a SKIPPED round moves nothing", () => {
+      eq(skip.body.balance, 21300);
+      eq(skip.body.result, "SKIPPED");
+    });
 
     const junk = await api("POST", "/round/submit", {
-      sessionId, round: { roundId: "r4", result: "WIN", riskAmount: 100 } // no payout at all
+      sessionId, round: { roundId: "r4", result: "WIN", riskAmount: 100 } // claims a WIN with no prediction/dir
     }, D);
     check("a round with no payout cannot poison the balance", () => {
       eq(junk.body.balance, 21300, "a malformed round changed the balance");
       assert(Number.isFinite(junk.body.balance), "balance is no longer finite");
     });
 
+    /* The core of the old bug: `payout` was applied verbatim, so a client could
+       name its own balance. The delta is now derived, so an absurd payout is
+       simply ignored and the stake/direction decide. */
+    const forged = await api("POST", "/round/submit", {
+      sessionId, round: { roundId: "r5", prediction: "UP", actualDir: "UP", riskAmount: 100, result: "WIN", payout: 999999999 }
+    }, D);
+    check("a forged payout is ignored — the delta is derived server-side", () => {
+      eq(forged.body.balance, 21480, "the client's payout was trusted");  // 21300 + 100×1.8
+      eq(forged.body.payout, 180);
+    });
+
+    // A retried request (response lost, client resends) must not pay twice.
+    const replay = await api("POST", "/round/submit", {
+      sessionId, round: { roundId: "r5", prediction: "UP", actualDir: "UP", riskAmount: 100, result: "WIN", payout: 180 }
+    }, D);
+    check("replaying the same roundId does not credit twice", () => {
+      eq(replay.status, 200);
+      eq(replay.body.balance, 21480);
+      eq(replay.body.duplicate, true);
+    });
+
+    const noId = await api("POST", "/round/submit", {
+      sessionId, round: { prediction: "UP", actualDir: "UP", riskAmount: 100 }
+    }, D);
+    check("a round with no roundId is 400", () => eq(noId.status, 400));
+
     const orphan = await api("POST", "/round/submit", {
-      sessionId: "sess_does_not_exist", round: { payout: 999999 }
+      sessionId: "sess_does_not_exist", round: { roundId: "rX", payout: 999999 }
     }, D);
     check("a round for an unknown session is rejected", () => eq(orphan.status, 400));
 
@@ -301,17 +336,101 @@ function api(method, route, body, deviceId) {
 
   group("9. Client/server payout math agrees");
   {
-    const clientCfg = require("fs").readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
-    const cm = clientCfg.match(/PAYOUT_MULTIPLIER:\s*([\d.]+)/);
-    const sm = require("fs").readFileSync(path.join(SERVER_DIR, "server.js"), "utf8").match(/PAYOUT_MULTIPLIER:\s*([\d.]+)/);
-    check("PAYOUT_MULTIPLIER matches on both sides", () => {
-      assert(cm && sm, "could not find PAYOUT_MULTIPLIER in both files");
-      eq(sm[1], cm[1], "server " + sm[1] + " vs client " + cm[1]);
-      return "×" + cm[1];
+    /* This used to diff two hand-copied tables, because there were two. They had
+       already drifted once — the server rolled ±40% swings where the client
+       rolled ±18% and weighted FLAT differently, so the game was measurably a
+       different game with a backend attached, and the balances the two paths
+       computed for the "same" round diverged.
+
+       Both sides now load ../rules.js, so the interesting question is no longer
+       "do the copies match" but "has anyone started a new copy". These checks
+       fail the moment a literal table reappears on either side. */
+    const fsx = require("fs");
+    const clientSrc = fsx.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+    const serverSrc = fsx.readFileSync(path.join(SERVER_DIR, "server.js"), "utf8");
+    const Rules = require(path.join(__dirname, "..", "rules.js"));
+
+    check("both sides take their rules from rules.js", () => {
+      assert(/require\(["'][./]*\.\.\/rules\.js["']\)/.test(serverSrc),
+        "server/server.js does not require ../rules.js");
+      assert(/CadeRules\.CONFIG/.test(clientSrc),
+        "app.js does not alias CadeRules.CONFIG");
+      const htmlSrc = fsx.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
+      const iRules = htmlSrc.indexOf('src="rules.js"');
+      const iApp = htmlSrc.indexOf('src="app.js"');
+      assert(iRules !== -1, "index.html never loads rules.js");
+      assert(iRules < iApp, "rules.js must load before app.js or CadeRules is undefined at alias time");
     });
-    const cd = clientCfg.match(/DAILY_POINTS:\s*(\d+)/);
-    const sd = require("fs").readFileSync(path.join(SERVER_DIR, "server.js"), "utf8").match(/DAILY_POINTS:\s*(\d+)/);
-    check("DAILY_POINTS matches on both sides", () => eq(sd[1], cd[1]));
+
+    check("neither side re-declares a rules table of its own", () => {
+      const decl = /(?:const|let|var)\s+(OUTCOMES|COIN_POOL|AWARD_DEFS|SIM_PLAYERS_BASE)\s*=\s*[[{]/;
+      const offenders = [];
+      if (decl.test(clientSrc)) offenders.push("app.js: " + clientSrc.match(decl)[1]);
+      if (decl.test(serverSrc)) offenders.push("server/server.js: " + serverSrc.match(decl)[1]);
+      assert(offenders.length === 0,
+        "a second copy of a shared table has appeared in " + offenders.join(", ") +
+        " — that is exactly how the ±18% / ±40% divergence happened");
+    });
+
+    check("neither side hard-codes a payout number", () => {
+      const nums = /(?:PAYOUT_MULTIPLIER|DAILY_POINTS|DYNAMIC_COIN_CHANCE)\s*:\s*[\d.]/;
+      const offenders = [];
+      if (nums.test(clientSrc)) offenders.push("app.js");
+      if (nums.test(serverSrc)) offenders.push("server/server.js");
+      assert(offenders.length === 0, "payout constants re-declared in " + offenders.join(", "));
+      return "×" + Rules.CONFIG.PAYOUT_MULTIPLIER + ", " + Rules.CONFIG.DAILY_POINTS + "/day";
+    });
+
+    /* Static checks can only prove nobody re-copied the table. This one proves
+       the running server actually pays what the shared rule says it should. */
+    const D = "dev_payout_parity";
+    await api("POST", "/daily-claim", {}, D);
+    await api("POST", "/session/start", { session: { sessionId: "s_parity", rounds: [] } }, D);
+    const stake = 1000;
+    const win = await api("POST", "/round/submit", {
+      sessionId: "s_parity",
+      round: { roundId: "r_parity_win", prediction: "UP", actualDir: "UP", riskAmount: stake }
+    }, D);
+    const loss = await api("POST", "/round/submit", {
+      sessionId: "s_parity",
+      round: { roundId: "r_parity_loss", prediction: "UP", actualDir: "DOWN", riskAmount: stake }
+    }, D);
+    check("a live win pays exactly Rules.scoreRound()", () => {
+      const expect = Rules.scoreRound("UP", "UP", stake);
+      eq(win.status, 200, "round/submit returned " + JSON.stringify(win.body));
+      eq(win.body.result, expect.result);
+      eq(win.body.payout, expect.payout, "server paid " + win.body.payout + ", rule says " + expect.payout);
+      return "+" + expect.payout;
+    });
+    check("a live loss debits exactly Rules.scoreRound()", () => {
+      const expect = Rules.scoreRound("UP", "DOWN", stake);
+      eq(loss.body.result, expect.result);
+      eq(loss.body.payout, expect.payout);
+      return String(expect.payout);
+    });
+  }
+
+  group("10. Session lifecycle cannot be short-circuited");
+  {
+    const D = "dev_orphan_end";
+    await api("POST", "/daily-claim", {}, D);
+    /* This used to succeed against a null activeSession: Object.assign({}, null,
+       session) built a session out of whatever the client sent, filed it in the
+       history, and ratcheted every personal record from unvalidated numbers. */
+    const orphanEnd = await api("POST", "/session/end", {
+      session: { sessionId: "never_started", netResult: 99999999, largestPayout: 99999999, winRate: 100 }
+    }, D);
+    check("ending a session that was never started is 400", () => eq(orphanEnd.status, 400));
+
+    const recs = await api("GET", "/records", undefined, D);
+    check("the forged numbers did not reach the records", () => {
+      eq(recs.body.records.biggestPayout, 0);
+      eq(recs.body.records.bestWinRate, 0);
+      eq(recs.body.records.bestSessionNet, null);
+    });
+
+    const hist = await api("GET", "/history", undefined, D);
+    check("the forged session is not in the history", () => eq(hist.body.sessions.length, 0));
   }
 
   console.log("\n" + "=".repeat(60));
