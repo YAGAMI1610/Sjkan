@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+<polygon points="100,8 178,50 178,150 100,192 22,150 22,50"
+ fill="#FF7A29" stroke="#111111" stroke-width="8" stroke-linejoin="round"/>
+<path d="M100 60 C80 90 78 110 100 130 C122 110 120 90 100 60 Z
+         M100 80 C92 96 92 106 100 116 C108 106 108 96 100 80 Z"
+ fill="#D62828" stroke="#111111" stroke-width="5" stroke-linejoin="round"/>
+<rect x="60" y="150" width="80" height="18" rx="9" fill="#111111"/>
+<text x="100" y="163" font-family="Arial Black" font-size="12" font-weight="900" fill="#FFD23F" text-anchor="middle">GRIND</text>
+</svg>

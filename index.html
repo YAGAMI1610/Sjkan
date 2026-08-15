@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>CADE Meme Madness</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="cade-header">
+  <div class="cade-logo" onclick="Nav.go('home')" role="button" tabindex="0" aria-label="Go to home" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();Nav.go('home');}">
+    <div class="badge" id="headerLogoSlot"></div>
+    <span>CADE</span>
+  </div>
+  <div class="points-pill">💰 <span id="headerPoints">20,000</span></div>
+  <button class="nav-btn" id="muteToggle" aria-label="Mute sound" aria-pressed="true">🔇</button>
+  <button class="nav-btn" onclick="Nav.go('leaderboard')" aria-label="View leaderboard">🏆</button>
+</header>
+
+<div id="toastRoot"></div>
+
+<!-- ============ HOME ============ -->
+<section id="screen-home" class="screen active">
+  <div class="container">
+    <div class="hero sunburst-bg">
+      <div class="halftone-fade"></div>
+      <div class="tagline">PREDICTION ARCADE. BUILT FOR THE BOLD.</div>
+      <div class="hero-art" id="heroArtSlot"></div>
+      <h1>MEME<span>MADNESS</span></h1>
+      <div class="sub">TRAIN FOR THE CHAOS.</div>
+      <p class="desc">Claim your daily points. Pick a meme. Predict the move. Risk your points. Climb the leaderboard.</p>
+      <div class="hero-cta">
+        <button class="btn btn-yellow btn-block" onclick="Nav.go('arena')">START PLAYING</button>
+        <button class="btn btn-block" style="background:transparent;color:var(--cream);border-color:var(--cream);box-shadow:none;" onclick="Nav.go('how')">HOW IT WORKS</button>
+      </div>
+      <div class="sim-tag">SIMULATION ONLY — NO REAL MONEY</div>
+    </div>
+
+    <div class="card card-yellow">
+      <div class="flex-between">
+        <div>
+          <div class="muted">YOUR DAILY POINTS</div>
+          <h2 style="font-size:2.2rem;">20,000</h2>
+        </div>
+        <div id="claimIcon" style="font-size:2rem;">🎁</div>
+      </div>
+      <button id="claimBtn" class="btn btn-primary btn-block mt12" onclick="Game.claimDaily()">CLAIM 20,000 POINTS</button>
+      <div id="claimStatus" class="muted mt8" style="display:none;"></div>
+    </div>
+
+    <h3 class="section-title">BOOST YOUR POINTS</h3>
+    <div class="boost-grid" id="boostGrid"></div>
+
+    <h3 class="section-title">QUICK ACTIONS</h3>
+    <div class="boost-grid">
+      <div class="boost-card"><b>🗳️ VOTE</b><p class="muted small mt8">Vote for the next meme madness coin.</p><button class="btn btn-purple" onclick="Nav.go('vote')">GO VOTE</button></div>
+      <div class="boost-card"><b>📤 SUBMIT</b><p class="muted small mt8">Submit your own meme coin idea.</p><button class="btn btn-purple" onclick="Nav.go('submit')">SUBMIT MEME</button></div>
+      <div class="boost-card"><b>📜 HISTORY</b><p class="muted small mt8">See your past Meme Madness runs.</p><button class="btn btn-purple" onclick="Nav.go('history')">VIEW HISTORY</button></div>
+      <div class="boost-card"><b>🎖️ RECORDS</b><p class="muted small mt8">Check your personal best records.</p><button class="btn btn-purple" onclick="Nav.go('records')">MY RECORDS</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ HOW IT WORKS ============ -->
+<section id="screen-how" class="screen">
+  <div class="container">
+    <h2 class="section-title">HOW IT WORKS</h2>
+    <div class="card">1️⃣ Claim 20,000 free points every 24 hours.</div>
+    <div class="card">2️⃣ Start a session and meet a fictional meme coin.</div>
+    <div class="card">3️⃣ You get 25 seconds to predict UP or DOWN.</div>
+    <div class="card">4️⃣ Choose how many points to risk.</div>
+    <div class="card">5️⃣ Win = risk × 1.8 profit. Lose = risk amount deducted.</div>
+    <div class="card">6️⃣ Keep playing, earn awards, and climb the leaderboard!</div>
+    <div class="card purple center">
+      <b>100% SIMULATED — NO REAL MONEY, NO WALLETS, NO WITHDRAWALS.</b>
+    </div>
+    <button class="btn btn-primary btn-block" onclick="Nav.go('home')">BACK</button>
+  </div>
+</section>
+
+<!-- ============ ARENA ============ -->
+<section id="screen-arena" class="screen">
+  <div class="container">
+    <div id="arenaPreStart" class="card purple center">
+      <h2>READY FOR MADNESS?</h2>
+      <p class="mt8">Start a session to begin predicting meme coin moves.</p>
+      <button class="btn btn-yellow btn-block mt16" onclick="Game.startSession()">START SESSION</button>
+    </div>
+
+    <div id="arenaGame" style="display:none;">
+      <div class="arena-top">
+        <div class="round-tag" id="roundTag">ROUND 01</div>
+        <div class="arena-actions">
+          <button class="btn" onclick="Game.restartSessionRequest()">RESTART</button>
+          <button class="btn" onclick="Game.confirmEndSession()">END SESSION</button>
+        </div>
+      </div>
+
+      <div class="stats-strip" id="statsStrip"></div>
+
+      <div class="card coin-card" id="coinCard"></div>
+
+      <div class="chart-wrap card" id="chartCard"></div>
+
+      <div class="timer-wrap">
+        <div class="timer-circle" id="timerCircle">25</div>
+        <div class="predict-q">WHERE DO YOU THINK IT'S GOING?</div>
+      </div>
+
+      <div class="updown">
+        <button class="up-btn" id="upBtn" onclick="Game.selectPrediction('UP')">↑ UP</button>
+        <button class="down-btn" id="downBtn" onclick="Game.selectPrediction('DOWN')">↓ DOWN</button>
+      </div>
+
+      <div class="card mt16">
+        <b>HOW MANY POINTS DO YOU WANT TO RISK?</b>
+        <div class="risk-grid" id="riskGrid"></div>
+        <input type="number" id="customRisk" class="custom-risk" placeholder="Custom amount" style="display:none;" oninput="Game.setCustomRisk(this.value)" aria-label="Custom risk amount">
+        <div id="riskZeroNote" class="risk-zero-note" style="display:none;" role="status"></div>
+        <div id="tierBadgeWrap"></div>
+        <p class="payout-note">The more points you risk, the larger your potential payout — but the larger your potential loss.</p>
+
+        <div class="payout-preview">
+          <div class="payout-box profit"><div class="muted">POTENTIAL PROFIT</div><div class="val" id="potProfit">+0</div></div>
+          <div class="payout-box loss"><div class="muted">POTENTIAL LOSS</div><div class="val" id="potLoss">-0</div></div>
+        </div>
+
+        <button class="btn btn-primary btn-block confirm-btn" id="confirmBtn" onclick="Game.reviewPrediction()" disabled>CONFIRM PREDICTION</button>
+
+        <div id="reviewPanel" class="card purple mt16" style="display:none;">
+          <b>REVIEW YOUR PREDICTION</b>
+          <div class="payout-preview mt12" style="justify-content:space-between;">
+            <div class="muted">PREDICTION</div><div id="revPrediction" style="font-weight:900;"></div>
+          </div>
+          <div class="flex-between mt8"><span class="muted">POINTS AT RISK</span><b id="revRisk"></b></div>
+          <div class="flex-between mt8"><span class="muted">POTENTIAL PROFIT</span><b id="revProfit"></b></div>
+          <div class="flex-between mt8"><span class="muted">POTENTIAL LOSS</span><b id="revLoss"></b></div>
+          <div class="hero-cta mt16">
+            <button class="btn btn-yellow btn-block" id="lockInBtn" onclick="Game.lockInPrediction()">LOCK IT IN</button>
+            <button class="btn btn-block" onclick="Game.cancelReview()">← CHANGE PREDICTION</button>
+          </div>
+        </div>
+
+        <div id="lockedBanner" class="locked-banner" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ LEADERBOARD ============ -->
+<section id="screen-leaderboard" class="screen">
+  <div class="container">
+    <h2 class="section-title">MEME MADNESS LEADERBOARD</h2>
+    <div class="tabs" id="lbTabs"></div>
+    <div id="lbList"></div>
+  </div>
+</section>
+
+<!-- ============ VOTE ============ -->
+<section id="screen-vote" class="screen">
+  <div class="container">
+    <h2 class="section-title">MEME MADNESS VOTE</h2>
+    <p class="muted">Which meme deserves to make the madness?</p>
+    <div class="card center purple mt12">
+      <div class="muted">VOTING ENDS IN</div>
+      <h2 id="voteTimer">60:00</h2>
+    </div>
+    <div id="voteList" class="mt16"></div>
+  </div>
+</section>
+
+<!-- ============ SUBMIT ============ -->
+<section id="screen-submit" class="screen">
+  <div class="container">
+    <h2 class="section-title">SUBMIT YOUR MEME</h2>
+    <div class="card">
+      <div class="form-field"><label>MEME COIN NAME</label><input id="subName" placeholder="e.g. Moon Frog"></div>
+      <div class="form-field"><label>TICKER</label><input id="subTicker" placeholder="e.g. MOONFROG"></div>
+      <div class="form-field"><label>DESCRIPTION</label><textarea id="subDesc" rows="3" placeholder="Why should this make the madness?"></textarea></div>
+      <div class="form-field"><label>LOGO EMOJI</label><input id="subLogo" placeholder="🐸"></div>
+      <div class="form-field"><label>CREATOR NAME</label><input id="subCreator" placeholder="Your name"></div>
+      <button class="btn btn-primary btn-block" onclick="Game.submitMeme()">SUBMIT TO MEME MADNESS</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ HISTORY ============ -->
+<section id="screen-history" class="screen">
+  <div class="container">
+    <h2 class="section-title">MY MEME MADNESS HISTORY</h2>
+    <div id="historyList"></div>
+  </div>
+</section>
+
+<!-- ============ RECORDS ============ -->
+<section id="screen-records" class="screen">
+  <div class="container">
+    <h2 class="section-title">MY RECORDS</h2>
+    <div class="records-grid" id="recordsGrid"></div>
+  </div>
+</section>
+
+<!-- ============ SESSION SUMMARY (post-ceremony) ============ -->
+<section id="screen-summary" class="screen">
+  <div class="container">
+    <h2 class="section-title">MEME MADNESS COMPLETE!</h2>
+    <div class="share-card" id="shareCardRoot"></div>
+    <div class="hero-cta mt16">
+      <button class="btn btn-yellow btn-block" onclick="Game.shareOnX()">SHARE ON X</button>
+      <button class="btn btn-block" onclick="Game.copyResults()">COPY RESULTS</button>
+      <button class="btn btn-block" onclick="Game.shareImage()">DOWNLOAD / SHARE IMAGE</button>
+      <button class="btn btn-primary btn-block" onclick="Game.playAgain()">PLAY AGAIN</button>
+      <button class="btn btn-block" onclick="Nav.go('history')">VIEW HISTORY</button>
+      <button class="btn btn-block" onclick="Nav.go('home')">BACK TO HOME</button>
+    </div>
+  </div>
+</section>
+
+<nav class="bottom-nav" aria-label="Main navigation">
+  <button onclick="Nav.go('home')" data-screen="home" aria-label="Home"><span class="ic" aria-hidden="true">🏠</span>HOME</button>
+  <button onclick="Nav.go('arena')" data-screen="arena" aria-label="Arena"><span class="ic" aria-hidden="true">🎮</span>ARENA</button>
+  <button onclick="Nav.go('leaderboard')" data-screen="leaderboard" aria-label="Leaderboard"><span class="ic" aria-hidden="true">🏆</span>RANKS</button>
+  <button onclick="Nav.go('vote')" data-screen="vote" aria-label="Vote"><span class="ic" aria-hidden="true">🗳️</span>VOTE</button>
+  <button onclick="Nav.go('history')" data-screen="history" aria-label="History"><span class="ic" aria-hidden="true">📜</span>HISTORY</button>
+</nav>
+
+<!-- ============ MODALS / OVERLAYS (populated by JS) ============ -->
+<div id="modalRoot"></div>
+<div id="resultRoot"></div>
+<div id="ceremonyRoot"></div>
+<canvas id="shareCanvas" width="1000" height="1250" style="display:none;"></canvas>
+
+<script>
+  // Point this at your deployed backend (see /server). Left as "/api" so
+  // same-origin deployments work out of the box; if unreachable, api-client.js
+  // automatically falls back to the local/offline simulation.
+  window.CADE_API_BASE = window.CADE_API_BASE || "/api";
+</script>
+<script src="api-client.js"></script>
+<script src="audio.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
